@@ -1,0 +1,86 @@
+# configs/default.yaml
+# RC-TGAD: Retrieval-Augmented Curriculum Training for Temporal Graph Anomaly Detection
+#
+# HOW TO USE:
+#   from configs.config_loader import load_config
+#   cfg = load_config("configs/default.yaml")
+#
+# OVERRIDE FROM COMMAND LINE (for ablations):
+#   python experiments/run_rctgad.py --config configs/default.yaml --curriculum.k_warmup 20
+#
+# Each section maps exactly to one module:
+#   model      -> Person 1 (backbone)
+#   rag        -> Person 2 (rag_scorer)
+#   curriculum -> Person 3 (scheduler + trainer)
+#   training   -> Person 3 (trainer)
+#   data       -> Person 1 (dataset loaders)
+#   logging    -> Person 3 (wandb + checkpoints)
+
+# ─────────────────────────────────────────────────────────
+# MODEL  (Person 1 owns these)
+# ─────────────────────────────────────────────────────────
+model:
+  lstm_hidden:    64        # LSTM hidden state size — must match rag.vector_dim
+  lstm_layers:    2         # number of stacked LSTM layers
+  gnn_out_dim:    64        # GNN output embedding size — must match rag.vector_dim
+  gnn_heads:      4         # number of GAT attention heads
+  dropout:        0.1       # dropout rate in backbone
+  window_size:    30        # sliding window length W (timesteps)
+  d_in:           51        # input feature dimension (51 for SWAT, 55 for SMAP/MSL)
+
+# ─────────────────────────────────────────────────────────
+# RAG  (Person 2 owns these)
+# ─────────────────────────────────────────────────────────
+rag:
+  vector_dim:     64        # FAISS index dimension — must match model.gnn_out_dim
+  k_neighbors:    10        # number of neighbors to retrieve for H_RAG
+  alpha_1:        0.33      # weight for H_temp
+  alpha_2:        0.33      # weight for H_struct
+  alpha_3:        0.34      # weight for H_RAG  (sum of alphas must = 1.0)
+  gamma:          0.5       # within H_struct: balance depth vs centrality
+
+# ─────────────────────────────────────────────────────────
+# CURRICULUM  (Person 3 owns these)
+# ─────────────────────────────────────────────────────────
+curriculum:
+  enabled:              true   # set false for baseline runs
+  k_warmup:             30     # epochs over which curriculum opens up (0 → 100%)
+  safety_floor_ratio:   0.05   # min fraction of dataset that must be selected
+  fallback_ratio:       0.30   # fraction to fall back to if floor not met
+
+# ─────────────────────────────────────────────────────────
+# TRAINING  (Person 3 owns these)
+# ─────────────────────────────────────────────────────────
+training:
+  epochs:         100
+  batch_size:     64
+  lr:             0.001
+  weight_decay:   0.00001
+  grad_clip:      1.0       # max gradient norm for clipping
+  device:         cuda      # cuda or cpu
+  seed:           42        # for reproducibility — run 3 seeds: 42, 43, 44
+  val_every:      5         # validate every N epochs
+  threshold:      null      # null = find best threshold; or set fixed float
+
+# ─────────────────────────────────────────────────────────
+# DATA  (Person 1 owns these)
+# ─────────────────────────────────────────────────────────
+data:
+  dataset:        swat      # swat | smap | msl
+  data_dir:       data/raw
+  train_split:    0.7
+  val_split:      0.1
+  test_split:     0.2
+  normalize:      true      # per-node zero-mean unit-variance normalization
+  graph_threshold: 0.5      # Pearson correlation threshold for edge construction
+
+# ─────────────────────────────────────────────────────────
+# LOGGING  (Person 3 owns these)
+# ─────────────────────────────────────────────────────────
+logging:
+  use_wandb:      false     # set true when running real experiments
+  wandb_project:  rc-tgad
+  run_name:       default
+  checkpoint_dir: checkpoints
+  save_best_only: true
+  log_every:      5         # print to console every N epochs
