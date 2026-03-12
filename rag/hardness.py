@@ -34,16 +34,33 @@ def compute_h_temp(
     A sample with a very obvious reconstruction spike is EASY (H_temp → 0).
 
     Args:
-        x:             Raw signal window  — Tensor [d]
-        x_hat:         LSTM reconstruction — Tensor [d]
+        x:             Last-timestep signal — Tensor [d] or scalar Tensor [1].
+                       Must be same shape as x_hat.
+                       From real backbone: pass x_window[-1] (shape [1]).
+        x_hat:         LSTM reconstruction — Tensor [d] or [1].
+                       From real backbone: shape is [1] (single-channel per node).
         window_errors: Running list of all per-sample L2 errors seen so far.
                        Caller must maintain this list across the dataset.
         eps:           Small constant to prevent division by zero.
 
     Returns:
         float in [0, 1].
+
+    Note on shapes:
+        Person 1's backbone processes one node at a time (univariate LSTM),
+        so x_hat.shape == (1,). Pass x = x_window[-1] to match.
+        For mock/multi-channel use, x and x_hat can be any equal shape [d].
     """
-    e = torch.norm(x - x_hat, p=2).item()
+    # Flatten both to 1-D and ensure same length before norm
+    x_flat    = x.reshape(-1).float()
+    x_hat_flat = x_hat.reshape(-1).float()
+
+    # If sizes differ (e.g. x=[55] from raw signal, x_hat=[1] from LSTM),
+    # fall back to the scalar absolute error on the matching first element.
+    if x_flat.shape != x_hat_flat.shape:
+        e = abs(x_flat[0].item() - x_hat_flat[0].item())
+    else:
+        e = torch.norm(x_flat - x_hat_flat, p=2).item()
 
     e_min = float(min(window_errors)) if window_errors else 0.0
     e_max = float(max(window_errors)) if window_errors else 1.0
