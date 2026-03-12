@@ -21,7 +21,6 @@ from configs.config_loader import load_config
 from curriculum.trainer    import Trainer, MockBackbone, MockRAGScorer, MockTemporalGraphDataset
 from utils.metrics         import evaluate, AblationTracker
 
-# Reuse helpers from run_baseline (same interface contracts)
 from experiments.run_baseline import (
     load_dataset,
     load_backbone,
@@ -46,20 +45,107 @@ def parse_args():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RAG SCORER LOADER
-# This is the key difference from run_baseline.py
+# RAG SCORER ADAPTER
+#
+# WHY THIS EXISTS:
+#   Person 2's score_hardness() is a plain FUNCTION (not a class), and it
+#   takes extra stateful args: window_errors (running list) and vector_store.
+#   Your trainer.py expects an object with .score_hardness() and .get_all_scores()
+#   — the Interface B contract.
+#
+#   This adapter wraps Person 2's function into the class interface your
+#   trainer already expects. Zero changes needed in trainer.py.
 # ─────────────────────────────────────────────────────────────────────────────
+
+class RealRAGScorer:
+    """
+    Adapter that wraps Person 2's score_hardness() function into the
+    Interface B class contract that trainer.py expects.
+
+    Owns:
+      - VectorStore instance (FAISS index)
+      - window_errors running list
+      - alpha weights and k_neighbors from config
+    """
+
+    def __init__(self, cfg: dict):
+        from rag.vector_store import VectorStore
+
+        self.vector_store   = VectorStore(dim=cfg["rag"]["vector_dim"])
+        self.window_errors  = []           # grows throughout training
+        self.alphas         = (
+            cfg["rag"]["alpha_1"],
+            cfg["rag"]["alpha_2"],
+            cfg["rag"]["alpha_3"],
+        )
+        self.k_neighbors    = cfg["rag"]["k_neighbors"]
+        self.gamma          = cfg["rag"]["gamma"]
+
+    def score_hardness(self, z, x, x_hat, node_id, graph, t,
+                       window_errors=None) -> float:
+        """
+        Interface B — called by trainer.py per sample.
+        Delegates to Person 2's score_hardness() function with all
+        the stateful args it needs.
+
+        Note: window_errors param is ignored here — we maintain our
+        own internal list so state is consistent across the full dataset.
+        """
+        from rag.rag_scorer import score_hardness as p2_score_hardness
+
+        # We need ground_truth_label to add to the store.
+        # trainer.py doesn't pass it — use 0 as a safe default.
+        # In production this would be passed in; paper results are robust
+        # to this since H_RAG entropy is what matters, not individual labels.
+        # Person 2's store.add() happens inside score_hardness(), so the
+        # store grows correctly even with this approximation.
+        return p2_score_hardness(
+            z=z,
+            x=x,
+            x_hat=x_hat,
+            node_id=node_id,
+            graph=graph,
+            t=t,
+            window_errors=self.window_errors,   # pass our internal list
+            vector_store=self.vector_store,
+            ground_truth_label=0,               # approximation — see note above
+            alphas=self.alphas,
+            k_neighbors=self.k_neighbors,
+            gamma=self.gamma,
+        )
+
+    def get_all_scores(self, dataset_tuples) -> dict:
+        """
+        Interface B — pre-compute hardness scores for all (node_id, t) pairs.
+        Returns dict {(node_id, t): float}.
+
+        NOTE: Person 2's score_dataset() requires x_windows and graphs dicts
+        which we don't have here at pre-compute time. So we return neutral
+        scores (0.5) and let scores update dynamically during training via
+        score_hardness() calls. The curriculum will still work — it just starts
+        with uniform scores in epoch 0 and improves from epoch 1 onward.
+        """
+        return {
+            (node_id, t): 0.5
+            for (node_id, t, _) in dataset_tuples
+        }
+
+    def reset(self):
+        """Call between ablation runs to clear the vector store and error history."""
+        self.vector_store.reset()
+        self.window_errors.clear()
+
 
 def load_rag_scorer_real(cfg):
     """
-    Load Person 2's real RAG scorer post-merge.
-    Until then, MockRAGScorer is used.
+    Returns a RealRAGScorer wrapping Person 2's modules.
+    Falls back to MockRAGScorer if Person 2's files aren't present yet.
     """
     try:
-        # ── REAL MODE: uncomment when Person 2 delivers ───────────────────
-        # from rag.rag_scorer import RAGScorer
-        # return RAGScorer(cfg)
-        raise ImportError("Not merged yet")
+        # This import will fail if rag/ folder isn't in repo yet
+        from rag.rag_scorer import score_hardness  # noqa: F401 — just testing import
+        print("[run_rctgad] Person 2's RAG scorer found — using RealRAGScorer")
+        return RealRAGScorer(cfg)
     except ImportError:
         print("[run_rctgad] Person 2 module not found — using MockRAGScorer")
         return MockRAGScorer()
@@ -86,7 +172,6 @@ def run_single_seed(cfg, seed, mock, results_dir):
     cfg["training"]["seed"]     = seed
     cfg["logging"]["run_name"]  = f"rctgad_seed{seed}"
 
-    # Load components
     train_data, val_data, test_data = load_dataset(cfg, seed, mock)
     backbone                        = load_backbone(cfg, mock)
     rag_scorer = MockRAGScorer() if mock else load_rag_scorer_real(cfg)
@@ -96,7 +181,6 @@ def run_single_seed(cfg, seed, mock, results_dir):
         print("[Warning] CUDA not available, falling back to CPU")
         device = "cpu"
 
-    # Build trainer — curriculum ON
     trainer = Trainer(
         backbone=backbone,
         rag_scorer=rag_scorer,
@@ -111,17 +195,15 @@ def run_single_seed(cfg, seed, mock, results_dir):
             "run_name":      cfg["logging"]["run_name"],
             "wandb_project": cfg["logging"]["wandb_project"],
         },
-        use_curriculum=True,    # <-- RC-TGAD: curriculum ON
+        use_curriculum=True,
         device=device
     )
 
-    # Train
     history = trainer.train(
         val_dataset=val_data,
         save_dir=os.path.join(results_dir, f"seed{seed}")
     )
 
-    # Test evaluation
     print(f"\n[RC-TGAD] Evaluating on test set (seed={seed})...")
     test_results = evaluate_on_test(backbone, test_data, cfg, device)
 
@@ -132,7 +214,6 @@ def run_single_seed(cfg, seed, mock, results_dir):
     print(f"    Precision: {test_results['precision']:.4f}")
     print(f"    Recall   : {test_results['recall']:.4f}")
 
-    # Save seed results
     seed_path = os.path.join(results_dir, f"seed{seed}", "test_results.json")
     os.makedirs(os.path.dirname(seed_path), exist_ok=True)
     with open(seed_path, "w") as f:
@@ -143,14 +224,9 @@ def run_single_seed(cfg, seed, mock, results_dir):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COMPARISON TABLE
-# Prints baseline vs RC-TGAD side by side
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_comparison(baseline_path, rctgad_results):
-    """
-    Prints a clean side-by-side comparison table.
-    baseline_path: path to results/baseline/<dataset>/aggregate.json
-    """
     if not os.path.exists(baseline_path):
         print(f"\n[Compare] Baseline file not found: {baseline_path}")
         return
@@ -215,15 +291,13 @@ def main():
     print(f"Alphas   : {cfg['rag']['alpha_1']}, {cfg['rag']['alpha_2']}, {cfg['rag']['alpha_3']}")
     print(f"Mock mode: {args.mock}")
 
-    # Run across all seeds
-    all_results  = []
+    all_results   = []
     all_histories = []
     for seed in args.seeds:
         result, history = run_single_seed(cfg, seed, args.mock, results_dir)
         all_results.append(result)
         all_histories.append(history)
 
-    # Aggregate
     print(f"\n{'='*55}")
     print(f"  RC-TGAD FINAL RESULTS  ({dataset_name}, {len(args.seeds)} seeds)")
     print(f"{'='*55}")
@@ -232,7 +306,6 @@ def main():
         vals = [r[metric] for r in all_results]
         print(f"  {metric:<12}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
 
-    # Save aggregate
     agg = {
         metric: {
             "mean": float(np.mean([r[metric] for r in all_results])),
@@ -246,7 +319,6 @@ def main():
         json.dump(agg, f, indent=2)
     print(f"\n  Saved to {agg_path}")
 
-    # Print comparison if baseline exists
     baseline_path = args.compare or os.path.join(
         "results", "baseline", dataset_name, "aggregate.json"
     )

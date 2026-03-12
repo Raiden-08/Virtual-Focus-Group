@@ -1,37 +1,73 @@
+# configs/default.yaml
+# RC-TGAD: Retrieval-Augmented Curriculum Training for Temporal Graph Anomaly Detection
+
+# ─────────────────────────────────────────────────────────
+# MODEL  (Person 1 owns these)
+# ─────────────────────────────────────────────────────────
 model:
-  d_in: 1               # feature dim per node (univariate)
-  lstm_hidden: 64       # MUST match gnn_out_dim — agreed with Person 2
-  gnn_out_dim: 64       # FAISS vector store dimension
-  lstm_layers: 2
-  gat_heads: 4
-  dropout: 0.1
-  window_size: 30
-  k_neighbors: 10       # FAISS retrieval k for H_RAG
+  lstm_hidden:    64        # must match rag.vector_dim
+  lstm_layers:    2
+  gnn_out_dim:    64        # must match rag.vector_dim
+  gnn_heads:      4
+  dropout:        0.1
+  window_size:    30
+  d_in:           1         # Person 1: univariate per node (d_in=1 from base_dataset.py)
+  num_nodes:      55        # 51 for SWAT | 55 for SMAP and MSL — override per run
 
+# ─────────────────────────────────────────────────────────
+# RAG  (Person 2 owns these)
+# ─────────────────────────────────────────────────────────
+rag:
+  vector_dim:     64        # must match model.gnn_out_dim
+  k_neighbors:    10
+  alpha_1:        0.33      # H_temp weight
+  alpha_2:        0.33      # H_struct weight
+  alpha_3:        0.34      # H_RAG weight  (sum must = 1.0)
+  gamma:          0.5       # within H_struct: depth vs centrality
+
+# ─────────────────────────────────────────────────────────
+# CURRICULUM  (Person 3 owns these)
+# ─────────────────────────────────────────────────────────
 curriculum:
-  k_warmup: 30          # epochs over which curriculum fully opens
-  alpha_1: 0.33         # H_temp weight
-  alpha_2: 0.33         # H_struct weight
-  alpha_3: 0.34         # H_RAG weight
-  gamma: 0.5            # within H_struct (depth vs centrality)
+  enabled:              true
+  k_warmup:             30
+  safety_floor_ratio:   0.05
+  fallback_ratio:       0.30
 
+# ─────────────────────────────────────────────────────────
+# TRAINING  (Person 3 owns these)
+# ─────────────────────────────────────────────────────────
 training:
-  epochs: 100
-  batch_size: 64
-  lr: 0.001
-  weight_decay: 1.0e-5
-  device: cuda
-  grad_clip: 1.0
-  checkpoint_dir: checkpoints/
+  epochs:         100
+  batch_size:     64
+  lr:             0.001
+  weight_decay:   0.00001
+  grad_clip:      1.0
+  device:         cuda
+  seed:           42
+  val_every:      5
+  threshold:      null
 
+# ─────────────────────────────────────────────────────────
+# DATA  (Person 1 owns these)
+# ─────────────────────────────────────────────────────────
 data:
-  swat_dir: data/raw
-  smap_dir: data/raw/smap
-  msl_dir: data/raw/smap   # same repo as SMAP
-  train_ratio: 0.6
-  val_ratio: 0.1
-  stride: 1
+  dataset:        swat
+  data_dir:       data/raw
+  stride:         1         # sliding window stride
+  train_split:    0.7
+  val_split:      0.15      # matches Person 1's default val_ratio=0.15
+  test_split:     0.15
+  normalize:      true
+  graph_threshold: 0.5
 
+# ─────────────────────────────────────────────────────────
+# LOGGING  (Person 3 owns these)
+# ─────────────────────────────────────────────────────────
 logging:
-  wandb_project: rc-tgad
-  log_interval: 10      # log every N epochs
+  use_wandb:      false
+  wandb_project:  rc-tgad
+  run_name:       default
+  checkpoint_dir: checkpoints
+  save_best_only: true
+  log_every:      5
