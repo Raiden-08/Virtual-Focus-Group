@@ -37,14 +37,24 @@ def parse_args():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATASET LOADER
-# Swap mock → real when Person 1 delivers data loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_dataset(cfg, seed, mock=False):
     """
     Returns (train_dataset, val_dataset, test_dataset).
-    Mock mode: synthetic data — no files needed.
-    Real mode: loads SWAT / SMAP / MSL from data/raw/
+
+    Mock mode : synthetic data, no files needed.
+    Real mode : calls Person 1's load_smap() / load_msl() / load_swat().
+
+    KEY FACTS about Person 1's datasets (from base_dataset.py):
+      - __getitem__ returns dict with keys:
+            x_window : Tensor [W, 1]   (d_in=1, univariate per node)
+            node_id  : int
+            t        : int
+            graph    : torch_geometric Data  (shared static graph)
+            label    : int  (1 if ANY step in window is anomalous)
+      - as_flat_list() returns [(node_id, t, label), ...]
+        → we attach this as .as_tuples for the curriculum scheduler
     """
     if mock:
         d_in       = cfg["model"]["d_in"]
@@ -54,25 +64,46 @@ def load_dataset(cfg, seed, mock=False):
         test_data  = MockTemporalGraphDataset(n_nodes=10, T=200, window_size=win, d_in=d_in, seed=seed+200)
         return train_data, val_data, test_data
 
-    # ── REAL MODE: swap these imports when Person 1 is ready ─────────────────
+    # ── REAL MODE ─────────────────────────────────────────────────────────────
+    # Person 1 exposes plain functions, not class constructors.
+    # load_smap / load_msl return (train_ds, val_ds, test_ds, channel_ids)
+    # load_swat  returns (train_ds, val_ds, test_ds, channel_ids)  [same pattern]
     dataset_name = cfg["data"]["dataset"]
+    win    = cfg["model"]["window_size"]
+    stride = cfg["data"].get("stride", 1)
+
     if dataset_name == "swat":
-        from data.swat import SWATDataset
-        train_data = SWATDataset(cfg, split="train")
-        val_data   = SWATDataset(cfg, split="val")
-        test_data  = SWATDataset(cfg, split="test")
+        from data.swat import load_swat
+        train_data, val_data, test_data, _ = load_swat(
+            data_dir  = cfg["data"]["data_dir"],
+            window    = win,
+            stride    = stride,
+            val_ratio = cfg["data"]["val_split"],
+        )
     elif dataset_name == "smap":
-        from data.smap import SMAPDataset
-        train_data = SMAPDataset(cfg, split="train")
-        val_data   = SMAPDataset(cfg, split="val")
-        test_data  = SMAPDataset(cfg, split="test")
+        from data.smap import load_smap
+        train_data, val_data, test_data, _ = load_smap(
+            data_dir  = cfg["data"].get("data_dir", "data/raw/smap"),
+            window    = win,
+            stride    = stride,
+            val_ratio = cfg["data"]["val_split"],
+        )
     elif dataset_name == "msl":
-        from data.msl import MSLDataset
-        train_data = MSLDataset(cfg, split="train")
-        val_data   = MSLDataset(cfg, split="val")
-        test_data  = MSLDataset(cfg, split="test")
+        from data.smap import load_msl      # load_msl lives inside smap.py
+        train_data, val_data, test_data, _ = load_msl(
+            data_dir  = cfg["data"].get("data_dir", "data/raw/smap"),
+            window    = win,
+            stride    = stride,
+            val_ratio = cfg["data"]["val_split"],
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    # Attach .as_tuples — curriculum scheduler needs (node_id, t, label) list.
+    # Person 1's dataset exposes as_flat_list() for exactly this purpose.
+    train_data.as_tuples = train_data.as_flat_list()
+    val_data.as_tuples   = val_data.as_flat_list()
+    test_data.as_tuples  = test_data.as_flat_list()
 
     return train_data, val_data, test_data
 
@@ -80,24 +111,30 @@ def load_dataset(cfg, seed, mock=False):
 def load_backbone(cfg, mock=False):
     """
     Returns backbone model.
-    Mock mode: random linear layers.
-    Real mode: Person 1's LSTM+GNN backbone.
+    Mock mode : random linear layers (no torch_geometric needed).
+    Real mode : Person 1's Backbone — takes individual kwargs, NOT a config dict.
     """
     if mock:
         return MockBackbone(
             d_in=cfg["model"]["d_in"],
             d_z=cfg["model"]["gnn_out_dim"]
         )
-    # ── REAL MODE: swap when Person 1 is ready ────────────────────────────
+    # ── REAL MODE ─────────────────────────────────────────────────────────────
     from backbone.backbone import Backbone
-    return Backbone(cfg)
+    return Backbone(
+        d_in        = cfg["model"]["d_in"],           # 1 (univariate per node)
+        hidden_size = cfg["model"]["lstm_hidden"],    # 64
+        gnn_out_dim = cfg["model"]["gnn_out_dim"],    # 64
+        num_nodes   = cfg["model"]["num_nodes"],      # 51 SWAT / 55 SMAP,MSL
+        window_size = cfg["model"]["window_size"],    # 30
+        lstm_layers = cfg["model"]["lstm_layers"],    # 2
+        gat_heads   = cfg["model"]["gnn_heads"],      # 4
+        dropout     = cfg["model"]["dropout"],        # 0.1
+    )
 
 
 def load_rag_scorer(cfg, mock=False):
-    """
-    Returns RAG scorer.
-    Baseline always uses mock scorer (hardness scores not used — curriculum is off).
-    """
+    """Baseline always uses mock scorer — curriculum is OFF, scores are unused."""
     return MockRAGScorer()
 
 
@@ -108,27 +145,82 @@ def load_rag_scorer(cfg, mock=False):
 def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
     """
     Run inference on test set, compute all metrics.
-    Returns results dict from utils/metrics.py evaluate().
+
+    IMPORTANT — how Person 1's backbone works:
+      - backbone.forward(x_windows, graph) expects x_windows: [N, W, d_in]
+        for ALL nodes at a single timestep, returns z_all [N,d_z], x_hat_all [N,d_in]
+      - We group by timestep t, stack all node windows, run one forward pass,
+        then collect per-node scores.
+      - backbone.get_embedding() exists but SKIPS the GNN — don't use it for eval.
     """
     import torch
     from torch.utils.data import DataLoader
+    from collections import defaultdict
 
     backbone.eval()
     all_scores = []
     all_labels = []
 
-    loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0)
+    if mock_backbone := isinstance(backbone, MockBackbone):
+        # ── MOCK PATH: per-sample forward (mock has no graph) ────────────────
+        loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0)
+        with torch.no_grad():
+            for batch in loader:
+                x_window = batch["x_window"].to(device)   # [B, W, d_in]
+                labels   = batch["label"]
+                for b in range(x_window.shape[0]):
+                    z, x_hat = backbone.get_embedding(x_window[b])
+                    score    = torch.norm(x_hat - x_window[b].mean(dim=0)).item()
+                    all_scores.append(score)
+                    all_labels.append(int(labels[b]))
 
-    with torch.no_grad():
-        for batch in loader:
-            x_window = batch["x_window"].to(device)
-            labels   = batch["label"]
+    else:
+        # ── REAL PATH: group samples by timestep t, full graph forward pass ──
+        # Person 1's dataset: each sample = one (node, t) pair.
+        # We need to batch ALL nodes at the same t together for the GNN.
+        loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
 
-            for b in range(x_window.shape[0]):
-                z, x_hat = backbone.get_embedding(x_window[b])
-                score    = torch.norm(x_hat - x_window[b].mean(dim=0)).item()
-                all_scores.append(score)
-                all_labels.append(int(labels[b]))
+        # Group by timestep
+        t_buckets = defaultdict(list)   # t -> list of {node_id, x_window, label}
+        graph     = None
+
+        with torch.no_grad():
+            for sample in loader:
+                t       = int(sample["t"][0])
+                node_id = int(sample["node_id"][0])
+                label   = int(sample["label"][0])
+                x_win   = sample["x_window"][0]           # [W, d_in]
+                if graph is None:
+                    graph = sample["graph"]               # shared, grab once
+
+                t_buckets[t].append({
+                    "node_id": node_id,
+                    "x_window": x_win,
+                    "label":    label
+                })
+
+            N = cfg["model"]["num_nodes"]
+
+            for t, node_samples in sorted(t_buckets.items()):
+                # Build [N, W, d_in] tensor — fill missing nodes with zeros
+                W    = cfg["model"]["window_size"]
+                d_in = cfg["model"]["d_in"]
+                x_all = torch.zeros(N, W, d_in)
+                node_map = {}
+                for s in node_samples:
+                    nid = s["node_id"]
+                    x_all[nid] = s["x_window"]
+                    node_map[nid] = s["label"]
+
+                x_all = x_all.to(device)
+                z_all, x_hat_all = backbone(x_all, graph)   # [N,d_z], [N,d_in]
+
+                for nid, label in node_map.items():
+                    score = torch.norm(
+                        x_hat_all[nid] - x_all[nid].mean(dim=0)
+                    ).item()
+                    all_scores.append(score)
+                    all_labels.append(label)
 
     return evaluate(all_scores, all_labels, verbose=False)
 
@@ -147,11 +239,9 @@ def run_single_seed(cfg, seed, mock, results_dir):
     print(f"  BASELINE RUN  |  seed={seed}  |  dataset={cfg['data']['dataset']}")
     print(f"{'='*55}")
 
-    # Override seed in config
-    cfg["training"]["seed"] = seed
+    cfg["training"]["seed"]    = seed
     cfg["logging"]["run_name"] = f"baseline_seed{seed}"
 
-    # Load components
     train_data, val_data, test_data = load_dataset(cfg, seed, mock)
     backbone                        = load_backbone(cfg, mock)
     rag_scorer                      = load_rag_scorer(cfg, mock)
@@ -161,36 +251,32 @@ def run_single_seed(cfg, seed, mock, results_dir):
         print("[Warning] CUDA not available, falling back to CPU")
         device = "cpu"
 
-    # Build trainer — curriculum OFF for baseline
     trainer = Trainer(
         backbone=backbone,
         rag_scorer=rag_scorer,
         dataset=train_data,
         config={
-            "epochs":       cfg["training"]["epochs"],
-            "k_warmup":     cfg["curriculum"]["k_warmup"],
-            "batch_size":   cfg["training"]["batch_size"],
-            "lr":           cfg["training"]["lr"],
-            "weight_decay": cfg["training"]["weight_decay"],
-            "use_wandb":    cfg["logging"]["use_wandb"],
-            "run_name":     cfg["logging"]["run_name"],
-            "wandb_project":cfg["logging"]["wandb_project"],
+            "epochs":        cfg["training"]["epochs"],
+            "k_warmup":      cfg["curriculum"]["k_warmup"],
+            "batch_size":    cfg["training"]["batch_size"],
+            "lr":            cfg["training"]["lr"],
+            "weight_decay":  cfg["training"]["weight_decay"],
+            "use_wandb":     cfg["logging"]["use_wandb"],
+            "run_name":      cfg["logging"]["run_name"],
+            "wandb_project": cfg["logging"]["wandb_project"],
         },
-        use_curriculum=False,   # <-- BASELINE: no curriculum
+        use_curriculum=False,
         device=device
     )
 
-    # Train
     history = trainer.train(
         val_dataset=val_data,
         save_dir=os.path.join(results_dir, f"seed{seed}")
     )
 
-    # Test evaluation
     print(f"\n[Baseline] Evaluating on test set (seed={seed})...")
     test_results = evaluate_on_test(backbone, test_data, cfg, device)
 
-    # Print results
     print(f"\n  Test Results (seed={seed}):")
     print(f"    F1-PA    : {test_results['f1_pa']:.4f}")
     print(f"    AUC-PR   : {test_results['auc_pr']:.4f}")
@@ -198,7 +284,6 @@ def run_single_seed(cfg, seed, mock, results_dir):
     print(f"    Precision: {test_results['precision']:.4f}")
     print(f"    Recall   : {test_results['recall']:.4f}")
 
-    # Save seed results
     seed_path = os.path.join(results_dir, f"seed{seed}", "test_results.json")
     os.makedirs(os.path.dirname(seed_path), exist_ok=True)
     with open(seed_path, "w") as f:
@@ -214,17 +299,14 @@ def run_single_seed(cfg, seed, mock, results_dir):
 def main():
     args = parse_args()
 
-    # Load config
     overrides = args.override or []
     if args.dataset:
         overrides.append(f"data.dataset={args.dataset}")
     if args.mock:
-        # Shorter run for mock testing
         overrides += ["training.epochs=20", "training.device=cpu"]
 
     cfg = load_config(args.config, overrides if overrides else None)
 
-    # Setup results directory
     dataset_name = cfg["data"]["dataset"]
     results_dir  = os.path.join("results", "baseline", dataset_name)
     os.makedirs(results_dir, exist_ok=True)
@@ -236,13 +318,11 @@ def main():
     print(f"Mock mode: {args.mock}")
     print(f"Results  : {results_dir}")
 
-    # Run across all seeds
     all_results = []
     for seed in args.seeds:
         result = run_single_seed(cfg, seed, args.mock, results_dir)
         all_results.append(result)
 
-    # Aggregate across seeds
     print(f"\n{'='*55}")
     print(f"  BASELINE FINAL RESULTS  ({dataset_name}, {len(args.seeds)} seeds)")
     print(f"{'='*55}")
@@ -251,7 +331,6 @@ def main():
         vals = [r[metric] for r in all_results]
         print(f"  {metric:<12}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
 
-    # Save aggregate
     agg = {
         metric: {
             "mean": float(np.mean([r[metric] for r in all_results])),

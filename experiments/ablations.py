@@ -25,6 +25,7 @@ from configs.config_loader  import load_config, get_ablation_configs
 from curriculum.trainer     import Trainer, MockBackbone, MockRAGScorer, MockTemporalGraphDataset
 from utils.metrics          import evaluate, AblationTracker
 from experiments.run_baseline import load_dataset, load_backbone, evaluate_on_test
+from experiments.run_rctgad  import RealRAGScorer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,11 +108,12 @@ def run_variant_seed(variant_name, cfg, seed, mock, results_dir):
         # Random scores — scheduler runs but hardness is meaningless
         rag_scorer = RandomHardnessScorer(seed=seed)
     else:
-        # All real curriculum variants: use real scorer post-merge, mock for now
+        # All real curriculum variants: use RealRAGScorer (wraps Person 2's modules)
+        # Falls back to MockRAGScorer automatically if rag/ not present yet
         try:
-            from rag.rag_scorer import RAGScorer
-            rag_scorer = RAGScorer(cfg)
-        except ImportError:
+            rag_scorer = RealRAGScorer(cfg)
+            rag_scorer.reset()   # critical: fresh store for each variant/seed
+        except Exception:
             rag_scorer = MockRAGScorer(seed=seed)
 
     # ── Build trainer ────────────────────────────────────────────────────────
