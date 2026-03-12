@@ -14,7 +14,8 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch_geometric.loader import DataLoader
+from torch.utils.data import Subset
 from typing import Dict, List, Tuple, Optional
 from curriculum.scheduler import get_batch, pacing
 
@@ -268,19 +269,26 @@ class Trainer:
             x_window = batch["x_window"].to(self.device)   # [B, W, d_in]
             labels   = batch["label"].float().to(self.device)  # [B]
 
+            from torch_geometric.data import Data
+
+            N = x_window.shape[0]
+
+            edge_index = torch.combinations(torch.arange(N), r=2).T
+            edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+
+            graph = Data(edge_index=edge_index.to(self.device))
+
             self.optimizer.zero_grad()
 
             # Process each sample in the batch
             # (In real version Person 1's backbone handles batching natively)
             batch_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
+            # Run backbone once for the full node batch
+            z_all, x_hat_all = self.backbone(x_window, graph)
+
             for b in range(x_window.shape[0]):
-                z, x_hat = self.backbone.get_embedding(
-                    x_window[b],                      # [W, d_in]
-                    graph=None,
-                    node_id=int(batch["node_id"][b]),
-                    t=int(batch["t"][b])
-                )
+                x_hat = x_hat_all[b]
 
                 # Reconstruction loss (unsupervised signal)
                 recon_loss = self.recon_loss_fn(x_hat, x_window[b].mean(dim=0))
@@ -321,14 +329,27 @@ class Trainer:
             x_window = batch["x_window"].to(self.device)
             labels   = batch["label"]
 
+            from torch_geometric.data import Data
+
+            N = x_window.shape[0]
+
+            edge_index = torch.combinations(torch.arange(N), r=2).T
+            edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+
+            graph = Data(edge_index=edge_index.to(self.device))
+
+            z_all, x_hat_all = self.backbone(x_window, graph)
+
             for b in range(x_window.shape[0]):
-                z, x_hat = self.backbone.get_embedding(x_window[b])
+                x_hat = x_hat_all[b]
+
                 score = torch.norm(x_hat - x_window[b].mean(dim=0)).item()
                 all_scores.append(score)
                 all_labels.append(int(labels[b]))
-
-        f1     = compute_f1(all_scores, all_labels)
+          
+        f1 = compute_f1(all_scores, all_labels)
         auc_pr = compute_auc_pr(all_scores, all_labels)
+
         return f1, auc_pr
 
     # ── MAIN TRAIN LOOP ──────────────────────────────────────────────────────
