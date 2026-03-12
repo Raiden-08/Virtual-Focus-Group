@@ -1,0 +1,37 @@
+model:
+  d_in: 1               # feature dim per node (univariate)
+  lstm_hidden: 64       # MUST match gnn_out_dim — agreed with Person 2
+  gnn_out_dim: 64       # FAISS vector store dimension
+  lstm_layers: 2
+  gat_heads: 4
+  dropout: 0.1
+  window_size: 30
+  k_neighbors: 10       # FAISS retrieval k for H_RAG
+
+curriculum:
+  k_warmup: 30          # epochs over which curriculum fully opens
+  alpha_1: 0.33         # H_temp weight
+  alpha_2: 0.33         # H_struct weight
+  alpha_3: 0.34         # H_RAG weight
+  gamma: 0.5            # within H_struct (depth vs centrality)
+
+training:
+  epochs: 100
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 1.0e-5
+  device: cuda
+  grad_clip: 1.0
+  checkpoint_dir: checkpoints/
+
+data:
+  swat_dir: data/raw
+  smap_dir: data/raw/smap
+  msl_dir: data/raw/smap   # same repo as SMAP
+  train_ratio: 0.6
+  val_ratio: 0.1
+  stride: 1
+
+logging:
+  wandb_project: rc-tgad
+  log_interval: 10      # log every N epochs
