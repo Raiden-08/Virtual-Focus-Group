@@ -231,12 +231,12 @@ class Trainer:
             labels   = batch["label"].float().to(self.device, non_blocking=True)  # [B]
 
             # ── Graph: use real if available, else build dummy ───────────────
-            graph = batch["graph"].to(self.device)
+            graph = None 
 
             self.optimizer.zero_grad()
 
             # ── ONE batched GPU forward pass — no Python loop ────────────────
-            z_all, x_hat_all = self.backbone(x_window, graph)  # [B,d_z], [B,d_in]
+            z_all, x_hat_all = self.backbone(x_window, None)  # [B,d_z], [B,d_in]
 
             # ── Losses — fully vectorised ────────────────────────────────────
             target        = x_window.mean(dim=1)                     # [B, d_in]
@@ -278,10 +278,10 @@ class Trainer:
             x_window = batch["x_window"].to(self.device, non_blocking=True)
             labels   = batch["label"]
 
-            graph = batch["graph"].to(self.device)
+            graph = None
 
             # ONE batched forward — no Python loop
-            _, x_hat_all = self.backbone(x_window, graph)            # [B, d_in]
+            _, x_hat_all = self.backbone(x_window, None)            # [B, d_in]
 
             target  = x_window.mean(dim=1)                           # [B, d_in]
             scores  = torch.norm(x_hat_all - target, dim=1)          # [B]
