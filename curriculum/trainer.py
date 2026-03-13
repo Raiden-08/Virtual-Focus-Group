@@ -224,19 +224,14 @@ class Trainer:
 
         total_loss = 0.0
         n_batches  = 0
-        dummy_graph = _make_dummy_graph(batch_size, self.device)
+        # dummy_graph = _make_dummy_graph(batch_size, self.device)
         for batch in loader:
             # ── Move data to GPU (non_blocking for async transfer) ───────────
             x_window = batch["x_window"].to(self.device, non_blocking=True)  # [B, W, d_in]
             labels   = batch["label"].float().to(self.device, non_blocking=True)  # [B]
 
             # ── Graph: use real if available, else build dummy ───────────────
-            graph = batch.get("graph")
-
-            if graph is None:
-                graph = dummy_graph
-            elif hasattr(graph, "edge_index"):
-                graph = graph.clone().to(self.device)
+            graph = batch["graph"].to(self.device)
 
             self.optimizer.zero_grad()
 
@@ -271,24 +266,19 @@ class Trainer:
         all_labels = []
 
         loader = DataLoader(
-        subset,
-        batch_size=batch_size,
-        shuffle=True,
+        val_dataset,
+        batch_size=64,
+        shuffle=False,
         num_workers=2,
         pin_memory=(self.device == "cuda"),
         persistent_workers=(self.device == "cuda"),
         collate_fn=_collate_graph,
         )
-
         for batch in loader:
             x_window = batch["x_window"].to(self.device, non_blocking=True)
             labels   = batch["label"]
 
-            graph = batch.get("graph")
-            if graph is None:
-                graph = _make_dummy_graph(x_window.shape[0], self.device)
-            elif hasattr(graph, 'edge_index'):
-                graph = graph.clone().to(self.device)
+            graph = batch["graph"].to(self.device)
 
             # ONE batched forward — no Python loop
             _, x_hat_all = self.backbone(x_window, graph)            # [B, d_in]
