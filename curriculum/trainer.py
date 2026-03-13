@@ -209,52 +209,83 @@ class Trainer:
     # ── SINGLE EPOCH ─────────────────────────────────────────────────────────
 
     def _train_epoch(self, indices: List[int], batch_size: int) -> float:
+
+        from collections import defaultdict
+
         self.backbone.train()
 
-        subset = Subset(self.dataset, indices)
-        loader = DataLoader(
-        subset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=(self.device == "cuda"),
-        persistent_workers=(self.device == "cuda"),
-        collate_fn=_collate_graph,
-        )
-
         total_loss = 0.0
-        n_batches  = 0
-        # dummy_graph = _make_dummy_graph(batch_size, self.device)
-        for batch in loader:
-            # ── Move data to GPU (non_blocking for async transfer) ───────────
-            x_window = batch["x_window"].to(self.device, non_blocking=True)  # [B, W, d_in]
-            labels   = batch["label"].float().to(self.device, non_blocking=True)  # [B]
+        n_steps = 0
 
-            # ── Graph: use real if available, else build dummy ───────────────
-            graph = None 
+        # --------------------------------------------------
+        # Group samples by timestep
+        # --------------------------------------------------
+
+        t_buckets = defaultdict(list)
+
+        for idx in indices:
+            sample = self.dataset[idx]
+
+            t_buckets[int(sample["t"])].append(sample)
+
+        # --------------------------------------------------
+        # Train one timestep at a time
+        # --------------------------------------------------
+
+        for t, samples in t_buckets.items():
+
+            N = self.backbone.num_nodes
+            W = samples[0]["x_window"].shape[0]
+            d_in = samples[0]["x_window"].shape[1]
+
+            x_all = torch.zeros(N, W, d_in)
+            labels = torch.zeros(N)
+
+            graph = samples[0]["graph"].to(self.device)
+
+            for s in samples:
+                nid = int(s["node_id"])
+
+                if nid >= N:
+                    continue
+
+                x_all[nid] = s["x_window"]
+                labels[nid] = s["label"]
+
+            x_all = x_all.to(self.device)
+            labels = labels.to(self.device)
+
+            graph = graph.to(self.device)
 
             self.optimizer.zero_grad()
 
-            # ── ONE batched GPU forward pass — no Python loop ────────────────
-            z_all, x_hat_all = self.backbone(x_window, None)  # [B,d_z], [B,d_in]
+            # -----------------------------
+            # Forward pass
+            # -----------------------------
 
-            # ── Losses — fully vectorised ────────────────────────────────────
-            target        = x_window.mean(dim=1)                     # [B, d_in]
-            recon_loss    = self.recon_loss_fn(x_hat_all, target)    # scalar
-            residuals     = x_hat_all - target                       # [B, d_in]
-            anomaly_logit = torch.norm(residuals, dim=1)             # [B]
-            cls_loss      = self.cls_loss_fn(anomaly_logit, labels)  # scalar
+            z_all, x_hat_all = self.backbone(x_all, graph)
+
+            target = x_all.mean(dim=1)
+
+            recon_loss = self.recon_loss_fn(x_hat_all, target)
+
+            residuals = x_hat_all - target
+            anomaly_logit = torch.norm(residuals, dim=1)
+
+            cls_loss = self.cls_loss_fn(anomaly_logit, labels)
 
             loss = recon_loss + 0.5 * cls_loss
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), max_norm=1.0)
+
+            torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), 1.0)
+
             self.optimizer.step()
 
             total_loss += loss.item()
-            n_batches  += 1
+            n_steps += 1
 
-        return total_loss / max(n_batches, 1)
-
+        return total_loss / max(n_steps, 1)
     # ── VALIDATION ───────────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -278,10 +309,8 @@ class Trainer:
             x_window = batch["x_window"].to(self.device, non_blocking=True)
             labels   = batch["label"]
 
-            graph = None
-
-            # ONE batched forward — no Python loop
-            _, x_hat_all = self.backbone(x_window, None)            # [B, d_in]
+            graph = batch["graph"].to(self.device)
+            _, x_hat_all = self.backbone(x_window, graph)            # [B, d_in]
 
             target  = x_window.mean(dim=1)                           # [B, d_in]
             scores  = torch.norm(x_hat_all - target, dim=1)          # [B]
