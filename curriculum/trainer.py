@@ -300,11 +300,9 @@ class Trainer:
         val_dataset,
         batch_size=64,
         shuffle=False,
-        num_workers=2,
-        pin_memory=(self.device == "cuda"),
-        persistent_workers=(self.device == "cuda"),
-        collate_fn=_collate_graph,
+        num_workers=0
         )
+        
         for batch in loader:
             x_window = batch["x_window"].to(self.device, non_blocking=True)
             labels   = batch["label"]
