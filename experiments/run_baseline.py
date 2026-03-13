@@ -178,7 +178,13 @@ def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
         # ── REAL PATH: group samples by timestep t, full graph forward pass ──
         # Person 1's dataset: each sample = one (node, t) pair.
         # We need to batch ALL nodes at the same t together for the GNN.
-        loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+        loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=lambda x: x[0]
+        )
 
         # Group by timestep
         t_buckets = defaultdict(list)   # t -> list of {node_id, x_window, label}
