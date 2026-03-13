@@ -290,117 +290,52 @@ class Trainer:
 
     @torch.no_grad()
     def _validate(self, val_dataset) -> Tuple[float, float]:
+
+        from collections import defaultdict
         from utils.metrics import compute_f1, compute_auc_pr
 
         self.backbone.eval()
+
         all_scores = []
         all_labels = []
 
-        loader = DataLoader(
-        val_dataset,
-        batch_size=64,
-        shuffle=False,
-        num_workers=0
-        )
-        
-        for batch in loader:
-            x_window = batch["x_window"].to(self.device, non_blocking=True)
-            labels   = batch["label"]
+        # Group samples by timestep
+        t_buckets = defaultdict(list)
 
-            graph = batch["graph"].to(self.device)
-            _, x_hat_all = self.backbone(x_window, graph)            # [B, d_in]
+        for i in range(len(val_dataset)):
+            sample = val_dataset[i]
+            t_buckets[int(sample["t"])].append(sample)
 
-            target  = x_window.mean(dim=1)                           # [B, d_in]
-            scores  = torch.norm(x_hat_all - target, dim=1)          # [B]
+        for t, samples in t_buckets.items():
+
+            N = self.backbone.num_nodes
+            W = samples[0]["x_window"].shape[0]
+            d_in = samples[0]["x_window"].shape[1]
+
+            x_all = torch.zeros(N, W, d_in)
+            labels = torch.zeros(N)
+
+            graph = samples[0]["graph"].to(self.device)
+
+            for s in samples:
+                nid = int(s["node_id"])
+                if nid >= N:
+                    continue
+
+                x_all[nid] = s["x_window"]
+                labels[nid] = s["label"]
+
+            x_all = x_all.to(self.device)
+
+            _, x_hat_all = self.backbone(x_all, graph)
+
+            target = x_all.mean(dim=1)
+            scores = torch.norm(x_hat_all - target, dim=1)
 
             all_scores.extend(scores.cpu().tolist())
             all_labels.extend(labels.tolist())
 
         return compute_f1(all_scores, all_labels), compute_auc_pr(all_scores, all_labels)
-
-    # ── MAIN TRAIN LOOP ──────────────────────────────────────────────────────
-
-    def train(self, val_dataset=None, save_dir: str = "checkpoints"):
-        os.makedirs(save_dir, exist_ok=True)
-
-        epochs     = self.config.get("epochs", 100)
-        k_warmup   = self.config.get("k_warmup", 30)
-        batch_size = self.config.get("batch_size", 64)
-        best_f1    = -1.0
-        best_epoch = -1
-
-        if self.use_curriculum:
-            hardness_scores = self._compute_all_hardness_scores()
-        else:
-            hardness_scores = {
-                (node_id, t): 0.0
-                for (node_id, t, _) in self.dataset.as_tuples
-            }
-
-        print(f"\n[Trainer] Starting training for {epochs} epochs...")
-        print("-" * 60)
-
-        for epoch in range(epochs):
-            t_start = time.time()
-
-            if self.use_curriculum:
-                indices = get_batch(
-                    self.dataset.as_tuples,
-                    hardness_scores,
-                    epoch, k_warmup,
-                    verbose=False
-                )
-            else:
-                indices = list(range(len(self.dataset)))
-
-            train_loss = self._train_epoch(indices, batch_size)
-            epoch_time = time.time() - t_start
-
-            f1, auc_pr = 0.0, 0.0
-            if val_dataset is not None and (epoch % 5 == 0 or epoch == epochs - 1):
-                f1, auc_pr = self._validate(val_dataset)
-
-                if f1 > best_f1:
-                    best_f1    = f1
-                    best_epoch = epoch
-                    ckpt_path  = os.path.join(save_dir, "best_model.pt")
-                    torch.save({
-                        "epoch":           epoch,
-                        "model_state":     self.backbone.state_dict(),
-                        "optimizer_state": self.optimizer.state_dict(),
-                        "f1":              f1,
-                        "auc_pr":          auc_pr,
-                        "config":          self.config
-                    }, ckpt_path)
-
-            pct = 100 * len(indices) / len(self.dataset)
-            lam = pacing(epoch, k_warmup)
-
-            self.history["train_loss"].append(train_loss)
-            self.history["val_f1"].append(f1)
-            self.history["val_auc_pr"].append(auc_pr)
-            self.history["n_samples"].append(len(indices))
-            self.history["pct_data"].append(pct)
-
-            if self.wandb:
-                self.wandb.log({
-                    "epoch": epoch, "train_loss": train_loss,
-                    "val_f1": f1, "val_auc_pr": auc_pr,
-                    "n_samples": len(indices), "pct_data": pct, "lambda": lam,
-                })
-
-            if epoch % 5 == 0 or epoch == epochs - 1:
-                print(
-                    f"Epoch {epoch:4d}/{epochs}  |  "
-                    f"λ={lam:.3f}  |  data={pct:5.1f}%  |  "
-                    f"loss={train_loss:.4f}  |  "
-                    f"F1={f1:.4f}  AUC-PR={auc_pr:.4f}  |  "
-                    f"{epoch_time:.1f}s"
-                )
-
-        print("-" * 60)
-        print(f"[Trainer] Done. Best F1={best_f1:.4f} at epoch {best_epoch}")
-        return self.history
 
 
 # ─────────────────────────────────────────────────────────────────────────────
