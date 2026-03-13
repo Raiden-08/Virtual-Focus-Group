@@ -151,7 +151,6 @@ def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
         for ALL nodes at a single timestep, returns z_all [N,d_z], x_hat_all [N,d_in]
       - We group by timestep t, stack all node windows, run one forward pass,
         then collect per-node scores.
-      - backbone.get_embedding() exists but SKIPS the GNN — don't use it for eval.
     """
     import torch
     from torch.utils.data import DataLoader
@@ -161,75 +160,94 @@ def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
     all_scores = []
     all_labels = []
 
-    if mock_backbone := isinstance(backbone, MockBackbone):
-        # ── MOCK PATH: per-sample forward (mock has no graph) ────────────────
-        loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0)
-        with torch.no_grad():
-            for batch in loader:
-                x_window = batch["x_window"].to(device)   # [B, W, d_in]
-                labels   = batch["label"]
-                for b in range(x_window.shape[0]):
-                    z, x_hat = backbone.get_embedding(x_window[b])
-                    score    = torch.norm(x_hat - x_window[b].mean(dim=0)).item()
-                    all_scores.append(score)
-                    all_labels.append(int(labels[b]))
+    # ───────────────── MOCK PATH ─────────────────
+    if isinstance(backbone, MockBackbone):
 
-    else:
-        # ── REAL PATH: group samples by timestep t, full graph forward pass ──
-        # Person 1's dataset: each sample = one (node, t) pair.
-        # We need to batch ALL nodes at the same t together for the GNN.
         loader = DataLoader(
-        test_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=lambda x: x[0]
+            test_dataset,
+            batch_size=64,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=(device == "cuda"),
+            persistent_workers=True
         )
 
-        # Group by timestep
-        t_buckets = defaultdict(list)   # t -> list of {node_id, x_window, label}
-        graph     = None
+        with torch.no_grad():
+            for batch in loader:
+
+                x_window = batch["x_window"].to(device, non_blocking=True)   # [B,W,d_in]
+                labels   = batch["label"]
+
+                # Batched GPU forward pass
+                _, x_hat_all = backbone(x_window, None)                      # [B,d_in]
+
+                target = x_window.mean(dim=1)                                 # [B,d_in]
+                scores = torch.norm(x_hat_all - target, dim=1)                # [B]
+
+                all_scores.extend(scores.cpu().tolist())
+                all_labels.extend(labels.tolist())
+
+    # ───────────────── REAL DATASET PATH ─────────────────
+    else:
+
+        loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=lambda x: x[0]
+        )
+
+        # Group samples by timestep
+        t_buckets = defaultdict(list)
+        graph = None
 
         with torch.no_grad():
+
             for sample in loader:
-                t       = int(sample["t"][0])
-                node_id = int(sample["node_id"][0])
-                label   = int(sample["label"][0])
-                x_win   = sample["x_window"][0]           # [W, d_in]
+
+                t       = int(sample["t"])
+                node_id = int(sample["node_id"])
+                label   = int(sample["label"])
+                x_win   = sample["x_window"]
+
                 if graph is None:
-                    graph = sample["graph"]               # shared, grab once
+                    graph = sample["graph"]
 
                 t_buckets[t].append({
                     "node_id": node_id,
                     "x_window": x_win,
-                    "label":    label
+                    "label": label
                 })
 
             N = cfg["model"]["num_nodes"]
 
             for t, node_samples in sorted(t_buckets.items()):
-                # Build [N, W, d_in] tensor — fill missing nodes with zeros
+
                 W    = cfg["model"]["window_size"]
                 d_in = cfg["model"]["d_in"]
+
                 x_all = torch.zeros(N, W, d_in)
                 node_map = {}
+
                 for s in node_samples:
                     nid = s["node_id"]
                     x_all[nid] = s["x_window"]
                     node_map[nid] = s["label"]
 
                 x_all = x_all.to(device)
-                z_all, x_hat_all = backbone(x_all, graph)   # [N,d_z], [N,d_in]
+
+                z_all, x_hat_all = backbone(x_all, graph)
 
                 for nid, label in node_map.items():
                     score = torch.norm(
                         x_hat_all[nid] - x_all[nid].mean(dim=0)
                     ).item()
+
                     all_scores.append(score)
                     all_labels.append(label)
 
     return evaluate(all_scores, all_labels, verbose=False)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SINGLE SEED RUN
