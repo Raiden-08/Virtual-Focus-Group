@@ -23,6 +23,7 @@ class MockBackbone(nn.Module):
         super().__init__()
         self.d_in = d_in
         self.d_z = d_z
+        self.num_nodes = 51
         self.lstm_mock  = nn.Linear(d_in, d_z)
         self.recon_mock = nn.Linear(d_z, d_in)
 
@@ -87,7 +88,8 @@ class MockTemporalGraphDataset(torch.utils.data.Dataset):
                     "x_window": torch.tensor(window),
                     "node_id":  n,
                     "t":        t,
-                    "label":    int(labels[n, t])
+                    "label":    int(labels[n, t]),
+                    "graph":    None
                 })
 
         self.as_tuples = [
@@ -241,7 +243,9 @@ class Trainer:
             x_all = torch.zeros(N, W, d_in)
             labels = torch.zeros(N)
 
-            graph = samples[0]["graph"].to(self.device)
+            graph = samples[0]["graph"]
+            if graph is not None:
+                graph = graph.to(self.device)
 
             for s in samples:
                 nid = int(s["node_id"])
@@ -255,7 +259,7 @@ class Trainer:
             x_all = x_all.to(self.device)
             labels = labels.to(self.device)
 
-            graph = graph.to(self.device)
+            if graph is not None: graph = graph.to(self.device)
 
             self.optimizer.zero_grad()
 
@@ -315,7 +319,9 @@ class Trainer:
             x_all = torch.zeros(N, W, d_in)
             labels = torch.zeros(N)
 
-            graph = samples[0]["graph"].to(self.device)
+            graph = samples[0]["graph"]
+            if graph is not None:
+                graph = graph.to(self.device)
 
             for s in samples:
                 nid = int(s["node_id"])

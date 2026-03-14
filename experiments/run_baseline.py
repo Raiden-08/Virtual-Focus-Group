@@ -163,13 +163,20 @@ def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
     # ───────────────── MOCK PATH ─────────────────
     if isinstance(backbone, MockBackbone):
 
+        def mock_collate(batch):
+            return {
+                "x_window": torch.stack([b["x_window"] for b in batch]),
+                "label": torch.tensor([b["label"] for b in batch]),
+                "node_id": [b["node_id"] for b in batch],
+                "t": [b["t"] for b in batch],
+                "graph": None,
+            }
         loader = DataLoader(
             test_dataset,
             batch_size=64,
             shuffle=False,
-            num_workers=4,
-            pin_memory=(device == "cuda"),
-            persistent_workers=True
+            num_workers=0,
+            collate_fn=mock_collate,
         )
 
         with torch.no_grad():
