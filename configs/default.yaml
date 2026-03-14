@@ -1,73 +1,51 @@
-# configs/default.yaml
-# RC-TGAD: Retrieval-Augmented Curriculum Training for Temporal Graph Anomaly Detection
-
-# ─────────────────────────────────────────────────────────
-# MODEL  (Person 1 owns these)
-# ─────────────────────────────────────────────────────────
 model:
-  lstm_hidden:    64        # must match rag.vector_dim
-  lstm_layers:    2
-  gnn_out_dim:    64        # must match rag.vector_dim
-  gnn_heads:      4
-  dropout:        0.1
-  window_size:    30
-  d_in:           1         # Person 1: univariate per node (d_in=1 from base_dataset.py)
-  num_nodes:      55        # 51 for SWAT | 55 for SMAP and MSL — override per run
+  d_in: 1               # feature dim per node (univariate)
+  lstm_hidden: 64       # MUST equal rag.vector_dim and gnn_out_dim
+  gnn_out_dim: 64       # FAISS vector store dimension
+  gnn_heads: 4          # GAT attention heads
+  lstm_layers: 2
+  dropout: 0.1
+  window_size: 30
+  num_nodes: 35         # 35 for SMAP | 51 for SWAT | 55 for MSL
 
-# ─────────────────────────────────────────────────────────
-# RAG  (Person 2 owns these)
-# ─────────────────────────────────────────────────────────
 rag:
-  vector_dim:     64        # must match model.gnn_out_dim
-  k_neighbors:    10
-  alpha_1:        0.33      # H_temp weight
-  alpha_2:        0.33      # H_struct weight
-  alpha_3:        0.34      # H_RAG weight  (sum must = 1.0)
-  gamma:          0.5       # within H_struct: depth vs centrality
+  vector_dim: 64        # MUST equal model.lstm_hidden and model.gnn_out_dim
+  alpha_1: 0.33         # H_temp weight
+  alpha_2: 0.33         # H_struct weight
+  alpha_3: 0.34         # H_RAG weight
+  k_neighbors: 10       # FAISS retrieval k for H_RAG
+  gamma: 0.5            # depth vs centrality balance in H_struct
 
-# ─────────────────────────────────────────────────────────
-# CURRICULUM  (Person 3 owns these)
-# ─────────────────────────────────────────────────────────
 curriculum:
-  enabled:              true
-  k_warmup:             30
-  safety_floor_ratio:   0.05
-  fallback_ratio:       0.30
+  enabled: true
+  k_warmup: 30          # epochs over which curriculum fully opens
+  k_rescore: 10         # re-run hardness scoring every N epochs
+  alpha_1: 0.33
+  alpha_2: 0.33
+  alpha_3: 0.34
+  gamma: 0.5
 
-# ─────────────────────────────────────────────────────────
-# TRAINING  (Person 3 owns these)
-# ─────────────────────────────────────────────────────────
 training:
-  epochs:         100
-  batch_size:     64
-  lr:             0.001
-  weight_decay:   0.00001
-  grad_clip:      1.0
-  device:         cuda
-  seed:           42
-  val_every:      5
-  threshold:      null
+  epochs: 100
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 1.0e-5
+  device: cuda
+  grad_clip: 1.0
+  checkpoint_dir: checkpoints/
+  seed: 42
 
-# ─────────────────────────────────────────────────────────
-# DATA  (Person 1 owns these)
-# ─────────────────────────────────────────────────────────
 data:
-  dataset:        swat
-  data_dir:       data/raw
-  stride:         1         # sliding window stride
-  train_split:    0.7
-  val_split:      0.15      # matches Person 1's default val_ratio=0.15
-  test_split:     0.15
-  normalize:      true
-  graph_threshold: 0.5
+  dataset: smap                  # active dataset: smap | swat | msl
+  data_dir: data/raw/smap        # used by load_smap / load_msl
+  val_split: 0.1                 # fraction of train used for validation
+  stride: 1
+  swat_dir: data/raw
+  smap_dir: data/raw/smap
+  msl_dir: data/raw/smap
 
-# ─────────────────────────────────────────────────────────
-# LOGGING  (Person 3 owns these)
-# ─────────────────────────────────────────────────────────
 logging:
-  use_wandb:      false
-  wandb_project:  rc-tgad
-  run_name:       default
-  checkpoint_dir: checkpoints
-  save_best_only: true
-  log_every:      5
+  wandb_project: rc-tgad
+  use_wandb: false
+  run_name: rctgad
+  log_interval: 10

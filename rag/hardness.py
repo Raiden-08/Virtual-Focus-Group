@@ -145,12 +145,15 @@ def compute_h_rag(z, vector_store, k: int = 10) -> float:
         k:            Number of neighbors to retrieve.
 
     Returns:
-        float in [0, 1].   Returns 0.0 if store is empty.
+        float in [0, 1].   Returns 0.5 if store is empty (maximum uncertainty prior).
     """
     neighbors = vector_store.query(z, k=k)
 
     if not neighbors:
-        return 0.0   # empty store → no information → treat as easy
+        # Empty store = no information = maximum uncertainty = hardest possible
+        # Returning 0.5 (not 0.0) ensures H_RAG contributes signal before
+        # the store is populated, and avoids collapsing H to a constant.
+        return 0.5
 
     labels = [n["label"] for n in neighbors]
     p_hat = sum(labels) / len(labels)   # proportion of anomalies

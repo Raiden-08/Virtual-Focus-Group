@@ -51,11 +51,15 @@ class MockRAGScorer:
         self._cache: Dict[Tuple, float] = {}
 
     def score_hardness(self, z, x, x_hat, node_id, graph, t,
-                       window_errors=None) -> float:
+                       window_errors=None, label: int = 0) -> float:
         key = (node_id, t)
         if key not in self._cache:
             self._cache[key] = float(self.rng.random())
         return self._cache[key]
+
+    def reset(self):
+        """Clear cache between rescore passes."""
+        self._cache.clear()
 
     def get_all_scores(self, dataset) -> Dict[Tuple, float]:
         return {
@@ -200,10 +204,76 @@ class Trainer:
     # ── HARDNESS SCORING ─────────────────────────────────────────────────────
 
     def _compute_all_hardness_scores(self) -> Dict[Tuple, float]:
-        print("[Trainer] Pre-computing hardness scores...")
-        t0     = time.time()
-        scores = self.rag_scorer.get_all_scores(self.dataset.as_tuples)
-        vals   = list(scores.values())
+        """
+        Score every sample by running a real forward pass through the backbone
+        and calling score_hardness() with real embeddings + ground-truth labels.
+
+        This ensures:
+          1. H_temp uses real reconstruction errors (not 0.5 placeholder)
+          2. H_RAG store is populated with real embeddings AND real labels
+             so entropy is meaningful from the very first epoch
+          3. Scores refresh as backbone improves (called every k_rescore epochs)
+        """
+        from collections import defaultdict
+
+        print("[Trainer] Pre-computing hardness scores (real forward pass)...")
+        t0      = time.time()
+        scores  = {}
+
+        self.backbone.eval()
+
+        # Group by timestep so we can do batched N-node forward passes
+        t_buckets = defaultdict(list)
+        for idx in range(len(self.dataset)):
+            sample = self.dataset[idx]
+            t_buckets[int(sample["t"])].append((idx, sample))
+
+        with torch.no_grad():
+            for t, idx_samples in t_buckets.items():
+                samples = [s for _, s in idx_samples]
+                idxs    = [i for i, _ in idx_samples]
+
+                N    = self.backbone.num_nodes
+                W    = samples[0]["x_window"].shape[0]
+                d_in = samples[0]["x_window"].shape[1]
+
+                x_all  = torch.zeros(N, W, d_in)
+                labels = torch.zeros(N, dtype=torch.long)
+                graph  = samples[0].get("graph", None)
+
+                for s in samples:
+                    nid = int(s["node_id"])
+                    if nid < N:
+                        x_all[nid]  = s["x_window"]
+                        labels[nid] = int(s["label"])
+
+                x_all = x_all.to(self.device)
+                if graph is not None:
+                    graph = graph.to(self.device)
+
+                z_all, x_hat_all = self.backbone(x_all, graph)
+
+                # Score each node that appeared in this timestep bucket
+                node_ids_in_bucket = {int(s["node_id"]) for s in samples}
+                for nid in node_ids_in_bucket:
+                    if nid >= N:
+                        continue
+                    z    = z_all[nid].cpu()
+                    x    = x_all[nid, -1, :].cpu()   # last timestep
+                    xhat = x_hat_all[nid].cpu()
+                    lbl  = int(labels[nid].item())
+
+                    if hasattr(self.rag_scorer, "score_hardness"):
+                        H = self.rag_scorer.score_hardness(
+                            z, x, xhat, nid, graph, t, label=lbl
+                        )
+                    else:
+                        H = 0.5
+                    scores[(nid, t)] = H
+
+        self.backbone.train()
+
+        vals = list(scores.values())
         print(f"[Trainer] Scored {len(scores)} samples in {time.time()-t0:.2f}s  "
               f"mean={np.mean(vals):.3f}  std={np.std(vals):.3f}")
         return scores
@@ -269,7 +339,9 @@ class Trainer:
 
             z_all, x_hat_all = self.backbone(x_all, graph)
 
-            target = x_all.mean(dim=1)
+            # Reconstruct last timestep (not mean) — matches Person 1's LSTM
+            # which predicts x[:, -1, :] via the recon_head
+            target = x_all[:, -1, :]          # [N, d_in]  last step
 
             recon_loss = self.recon_loss_fn(x_hat_all, target)
 
@@ -335,7 +407,7 @@ class Trainer:
 
             _, x_hat_all = self.backbone(x_all, graph)
 
-            target = x_all.mean(dim=1)
+            target = x_all[:, -1, :]   # last timestep — matches training target
             scores = torch.norm(x_hat_all - target, dim=1)
 
             all_scores.extend(scores.cpu().tolist())
@@ -355,6 +427,10 @@ class Trainer:
         best_f1    = -1.0
         best_epoch = -1
 
+        # How often to refresh hardness scores (every 10 epochs by default)
+        # Refreshing lets H_RAG improve as the backbone gets better trained
+        k_rescore = self.config.get("k_rescore", 10)
+
         if self.use_curriculum:
             hardness_scores = self._compute_all_hardness_scores()
         else:
@@ -364,11 +440,22 @@ class Trainer:
             }
 
         print(f"\n[Trainer] Starting training for {epochs} epochs...")
+        print(f"[Trainer] Hardness scores refreshed every {k_rescore} epochs")
         print("-" * 60)
 
         for epoch in range(epochs):
 
             t_start = time.time()
+
+            # ── Re-score hardness periodically so H_RAG improves with backbone ──
+            if self.use_curriculum and epoch > 0 and epoch % k_rescore == 0:
+                # Reset store so stale embeddings from early training don't persist
+                if hasattr(self.rag_scorer, "reset"):
+                    self.rag_scorer.reset()
+                hardness_scores = self._compute_all_hardness_scores()
+                vals = list(hardness_scores.values())
+                print(f"[Trainer] Epoch {epoch}: Rescored hardness  "
+                      f"mean={float(np.mean(vals)):.3f}  std={float(np.std(vals)):.3f}")
 
             if self.use_curriculum:
                 indices = get_batch(

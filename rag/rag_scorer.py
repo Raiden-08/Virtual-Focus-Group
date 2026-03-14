@@ -76,7 +76,15 @@ def score_hardness(
     # ------------------------------------------------------------------
     # Step 1: Compute current reconstruction error & append to history
     # ------------------------------------------------------------------
-    e = torch.norm(x - x_hat, p=2).item()
+    # Safe norm: flatten both tensors first to handle shape mismatches
+    # (x_hat from Person 1's backbone is [1], x from x_window[-1] is also [1],
+    #  but defensive flattening prevents silent NaN if shapes ever diverge)
+    x_flat     = x.reshape(-1).float()
+    x_hat_flat = x_hat.reshape(-1).float()
+    if x_flat.shape == x_hat_flat.shape:
+        e = torch.norm(x_flat - x_hat_flat, p=2).item()
+    else:
+        e = abs(x_flat[0].item() - x_hat_flat[0].item())
     window_errors.append(e)           # grow the running list
 
     # ------------------------------------------------------------------
