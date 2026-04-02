@@ -70,20 +70,22 @@ def load_swat(data_dir: str = "data/raw",
     attack_labels  = np.broadcast_to(
         row_labels[:, None], attack_signals.shape).copy()
 
-    # --- split normal into train / val ---
-    T_n = len(normal_signals)
-    t_train = int(T_n * train_ratio)
-    t_val   = int(T_n * (train_ratio + val_ratio))
+    # --- combine normal + attack, then split into train / val / test ---
+    all_signals = np.concatenate([normal_signals, attack_signals])
+    all_labels  = np.concatenate([normal_labels,  attack_labels])
 
-    train_sig = normal_signals[:t_train]
-    train_lbl = normal_labels[:t_train]
+    T_total = len(all_signals)
+    t_train = int(T_total * train_ratio)
+    t_val   = int(T_total * (train_ratio + val_ratio))
 
-    val_sig   = normal_signals[t_train:t_val]
-    val_lbl   = normal_labels[t_train:t_val]
+    train_sig = all_signals[:t_train]
+    train_lbl = all_labels[:t_train]
 
-    # test = remaining normal + all attack
-    test_sig  = np.concatenate([normal_signals[t_val:], attack_signals])
-    test_lbl  = np.concatenate([normal_labels[t_val:],  attack_labels])
+    val_sig   = all_signals[t_train:t_val]
+    val_lbl   = all_labels[t_train:t_val]
+
+    test_sig  = all_signals[t_val:]
+    test_lbl  = all_labels[t_val:]
 
     # build graph from training signals (after normalisation inside dataset)
     # graph is shared across splits — built on train stats
