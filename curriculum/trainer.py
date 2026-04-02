@@ -203,65 +203,268 @@ class Trainer:
 
     # ── HARDNESS SCORING ─────────────────────────────────────────────────────
 
-    def _compute_all_hardness_scores(self) -> Dict[Tuple, float]:
-        """
-        Score every sample by running a real forward pass through the backbone
-        and calling score_hardness() with real embeddings + ground-truth labels.
+    # def _compute_all_hardness_scores(self) -> Dict[Tuple, float]:
+    #     """
+    #     Score every sample by running a real forward pass through the backbone
+    #     and calling score_hardness() with real embeddings + ground-truth labels.
 
-        This ensures:
-          1. H_temp uses real reconstruction errors (not 0.5 placeholder)
-          2. H_RAG store is populated with real embeddings AND real labels
-             so entropy is meaningful from the very first epoch
-          3. Scores refresh as backbone improves (called every k_rescore epochs)
-        """
+    #     This ensures:
+    #       1. H_temp uses real reconstruction errors (not 0.5 placeholder)
+    #       2. H_RAG store is populated with real embeddings AND real labels
+    #          so entropy is meaningful from the very first epoch
+    #       3. Scores refresh as backbone improves (called every k_rescore epochs)
+    #     """
+    #     from collections import defaultdict
+
+    #     print("[Trainer] Pre-computing hardness scores (real forward pass)...")
+    #     t0      = time.time()
+    #     scores  = {}
+
+    #     self.backbone.eval()
+
+    #     # Group by timestep so we can do batched N-node forward passes
+    #     t_buckets = defaultdict(list)
+    #     for idx in range(len(self.dataset)):
+    #         sample = self.dataset[idx]
+    #         t_buckets[int(sample["t"])].append((idx, sample))
+
+    #     with torch.no_grad():
+    #         for t, idx_samples in t_buckets.items():
+    #             samples = [s for _, s in idx_samples]
+    #             idxs    = [i for i, _ in idx_samples]
+
+    #             N    = self.backbone.num_nodes
+    #             W    = samples[0]["x_window"].shape[0]
+    #             d_in = samples[0]["x_window"].shape[1]
+
+    #             x_all  = torch.zeros(N, W, d_in)
+    #             labels = torch.zeros(N, dtype=torch.long)
+    #             graph  = samples[0].get("graph", None)
+
+    #             for s in samples:
+    #                 nid = int(s["node_id"])
+    #                 if nid < N:
+    #                     x_all[nid]  = s["x_window"]
+    #                     labels[nid] = int(s["label"])
+
+    #             x_all = x_all.to(self.device)
+    #             if graph is not None:
+    #                 graph = graph.to(self.device)
+
+    #             z_all, x_hat_all = self.backbone(x_all, graph)
+
+    #             # Score each node that appeared in this timestep bucket
+    #             node_ids_in_bucket = {int(s["node_id"]) for s in samples}
+    #             for nid in node_ids_in_bucket:
+    #                 if nid >= N:
+    #                     continue
+    #                 z    = z_all[nid].cpu()
+    #                 x    = x_all[nid, -1, :].cpu()   # last timestep
+    #                 xhat = x_hat_all[nid].cpu()
+    #                 lbl  = int(labels[nid].item())
+
+    #                 if hasattr(self.rag_scorer, "score_hardness"):
+    #                     H = self.rag_scorer.score_hardness(
+    #                         z, x, xhat, nid, graph, t, label=lbl
+    #                     )
+    #                 else:
+    #                     H = 0.5
+    #                 scores[(nid, t)] = H
+
+    #     self.backbone.train()
+
+    #     vals = list(scores.values())
+    #     print(f"[Trainer] Scored {len(scores)} samples in {time.time()-t0:.2f}s  "
+    #           f"mean={np.mean(vals):.3f}  std={np.std(vals):.3f}")
+    #     return scores
+
+    # # ── SINGLE EPOCH ─────────────────────────────────────────────────────────
+
+    # def _train_epoch(self, indices: List[int], batch_size: int) -> float:
+
+    #     from collections import defaultdict
+
+    #     self.backbone.train()
+
+    #     total_loss = 0.0
+    #     n_steps = 0
+
+    #     # --------------------------------------------------
+    #     # Group samples by timestep
+    #     # --------------------------------------------------
+
+    #     t_buckets = defaultdict(list)
+
+    #     for idx in indices:
+    #         sample = self.dataset[idx]
+
+    #         t_buckets[int(sample["t"])].append(sample)
+
+    #     # --------------------------------------------------
+    #     # Train one timestep at a time
+    #     # --------------------------------------------------
+
+    #     for t, samples in t_buckets.items():
+
+    #         N = self.backbone.num_nodes
+    #         W = samples[0]["x_window"].shape[0]
+    #         d_in = samples[0]["x_window"].shape[1]
+
+    #         x_all = torch.zeros(N, W, d_in)
+    #         labels = torch.zeros(N)
+
+    #         graph = samples[0]["graph"]
+    #         if graph is not None:
+    #             graph = graph.to(self.device)
+
+    #         for s in samples:
+    #             nid = int(s["node_id"])
+
+    #             if nid >= N:
+    #                 continue
+
+    #             x_all[nid] = s["x_window"]
+    #             labels[nid] = s["label"]
+
+    #         x_all = x_all.to(self.device)
+    #         labels = labels.to(self.device)
+
+    #         if graph is not None: graph = graph.to(self.device)
+
+    #         self.optimizer.zero_grad()
+
+    #         # -----------------------------
+    #         # Forward pass
+    #         # -----------------------------
+
+    #         z_all, x_hat_all = self.backbone(x_all, graph)
+
+    #         # Reconstruct last timestep (not mean) — matches Person 1's LSTM
+    #         # which predicts x[:, -1, :] via the recon_head
+    #         target = x_all[:, -1, :]          # [N, d_in]  last step
+
+    #         recon_loss = self.recon_loss_fn(x_hat_all, target)
+
+    #         residuals = x_hat_all - target
+    #         anomaly_logit = torch.norm(residuals, dim=1)
+
+    #         cls_loss = self.cls_loss_fn(anomaly_logit, labels)
+
+    #         loss = recon_loss + 0.5 * cls_loss
+
+    #         loss.backward()
+
+    #         torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), 1.0)
+
+    #         self.optimizer.step()
+
+    #         total_loss += loss.item()
+    #         n_steps += 1
+
+    #     return total_loss / max(n_steps, 1)
+    # # ── VALIDATION ───────────────────────────────────────────────────────────
+
+    # @torch.no_grad()
+    # def _validate(self, val_dataset) -> Tuple[float, float]:
+
+    #     from collections import defaultdict
+    #     from utils.metrics import compute_f1, compute_auc_pr
+
+    #     self.backbone.eval()
+
+    #     all_scores = []
+    #     all_labels = []
+
+    #     # Group samples by timestep
+    #     t_buckets = defaultdict(list)
+
+    #     for i in range(len(val_dataset)):
+    #         sample = val_dataset[i]
+    #         t_buckets[int(sample["t"])].append(sample)
+
+    #     for t, samples in t_buckets.items():
+
+    #         N = self.backbone.num_nodes
+    #         W = samples[0]["x_window"].shape[0]
+    #         d_in = samples[0]["x_window"].shape[1]
+
+    #         x_all = torch.zeros(N, W, d_in)
+    #         labels = torch.zeros(N)
+
+    #         graph = samples[0]["graph"]
+    #         if graph is not None:
+    #             graph = graph.to(self.device)
+
+    #         for s in samples:
+    #             nid = int(s["node_id"])
+    #             if nid >= N:
+    #                 continue
+
+    #             x_all[nid] = s["x_window"]
+    #             labels[nid] = s["label"]
+
+    #         x_all = x_all.to(self.device)
+
+    #         _, x_hat_all = self.backbone(x_all, graph)
+
+    #         target = x_all[:, -1, :]   # last timestep — matches training target
+    #         scores = torch.norm(x_hat_all - target, dim=1)
+
+    #         all_scores.extend(scores.cpu().tolist())
+    #         all_labels.extend(labels.tolist())
+
+    #     return compute_f1(all_scores, all_labels), compute_auc_pr(all_scores, all_labels)
+
+    # ── HARDNESS SCORING ─────────────────────────────────────────────────────
+
+    def _compute_all_hardness_scores(self) -> Dict[Tuple, float]:
         from collections import defaultdict
 
-        print("[Trainer] Pre-computing hardness scores (real forward pass)...")
-        t0      = time.time()
-        scores  = {}
-
+        print("[Trainer] Pre-computing hardness scores (fast batched pass)...")
+        t0 = time.time()
+        scores = {}
         self.backbone.eval()
 
-        # Group by timestep so we can do batched N-node forward passes
+        # 1. LIGHTWEIGHT GROUPING: Read from as_tuples, NOT self.dataset[idx]
         t_buckets = defaultdict(list)
-        for idx in range(len(self.dataset)):
-            sample = self.dataset[idx]
-            t_buckets[int(sample["t"])].append((idx, sample))
+        for idx, (node_id, t, label) in enumerate(self.dataset.as_tuples):
+            t_buckets[t].append(idx)
 
         with torch.no_grad():
-            for t, idx_samples in t_buckets.items():
-                samples = [s for _, s in idx_samples]
-                idxs    = [i for i, _ in idx_samples]
+            for t, idxs in t_buckets.items():
+                
+                # Fetch only the samples for THIS timestep right before passing to GPU
+                samples = [self.dataset[i] for i in idxs]
 
-                N    = self.backbone.num_nodes
-                W    = samples[0]["x_window"].shape[0]
+                N = self.backbone.num_nodes
+                W = samples[0]["x_window"].shape[0]
                 d_in = samples[0]["x_window"].shape[1]
 
-                x_all  = torch.zeros(N, W, d_in)
+                x_all = torch.zeros(N, W, d_in, device=self.device)
                 labels = torch.zeros(N, dtype=torch.long)
-                graph  = samples[0].get("graph", None)
+                graph = samples[0].get("graph", None)
+                if graph is not None:
+                    graph = graph.to(self.device)
 
                 for s in samples:
                     nid = int(s["node_id"])
                     if nid < N:
-                        x_all[nid]  = s["x_window"]
+                        x_all[nid] = s["x_window"].to(self.device)
                         labels[nid] = int(s["label"])
 
-                x_all = x_all.to(self.device)
-                if graph is not None:
-                    graph = graph.to(self.device)
-
+                # Fast Batched Forward Pass
                 z_all, x_hat_all = self.backbone(x_all, graph)
 
-                # Score each node that appeared in this timestep bucket
-                node_ids_in_bucket = {int(s["node_id"]) for s in samples}
-                for nid in node_ids_in_bucket:
+                # Score each node
+                for s in samples:
+                    nid = int(s["node_id"])
                     if nid >= N:
                         continue
-                    z    = z_all[nid].cpu()
-                    x    = x_all[nid, -1, :].cpu()   # last timestep
+                    
+                    z = z_all[nid].cpu()
+                    x = x_all[nid, -1, :].cpu()   # last timestep
                     xhat = x_hat_all[nid].cpu()
-                    lbl  = int(labels[nid].item())
+                    lbl = int(labels[nid])
 
                     if hasattr(self.rag_scorer, "score_hardness"):
                         H = self.rag_scorer.score_hardness(
@@ -281,37 +484,33 @@ class Trainer:
     # ── SINGLE EPOCH ─────────────────────────────────────────────────────────
 
     def _train_epoch(self, indices: List[int], batch_size: int) -> float:
-
         from collections import defaultdict
 
         self.backbone.train()
-
         total_loss = 0.0
         n_steps = 0
 
         # --------------------------------------------------
-        # Group samples by timestep
+        # Group indices using lightweight tuples
         # --------------------------------------------------
-
         t_buckets = defaultdict(list)
-
         for idx in indices:
-            sample = self.dataset[idx]
-
-            t_buckets[int(sample["t"])].append(sample)
+            node_id, t, label = self.dataset.as_tuples[idx]
+            t_buckets[t].append(idx)
 
         # --------------------------------------------------
         # Train one timestep at a time
         # --------------------------------------------------
-
-        for t, samples in t_buckets.items():
+        for t, idxs in t_buckets.items():
+            
+            samples = [self.dataset[i] for i in idxs]
 
             N = self.backbone.num_nodes
             W = samples[0]["x_window"].shape[0]
             d_in = samples[0]["x_window"].shape[1]
 
-            x_all = torch.zeros(N, W, d_in)
-            labels = torch.zeros(N)
+            x_all = torch.zeros(N, W, d_in, device=self.device)
+            labels = torch.zeros(N, device=self.device)
 
             graph = samples[0]["graph"]
             if graph is not None:
@@ -319,76 +518,58 @@ class Trainer:
 
             for s in samples:
                 nid = int(s["node_id"])
-
-                if nid >= N:
-                    continue
-
-                x_all[nid] = s["x_window"]
-                labels[nid] = s["label"]
-
-            x_all = x_all.to(self.device)
-            labels = labels.to(self.device)
-
-            if graph is not None: graph = graph.to(self.device)
+                if nid < N:
+                    x_all[nid] = s["x_window"].to(self.device)
+                    labels[nid] = s["label"]
 
             self.optimizer.zero_grad()
 
-            # -----------------------------
-            # Forward pass
-            # -----------------------------
-
             z_all, x_hat_all = self.backbone(x_all, graph)
 
-            # Reconstruct last timestep (not mean) — matches Person 1's LSTM
-            # which predicts x[:, -1, :] via the recon_head
-            target = x_all[:, -1, :]          # [N, d_in]  last step
-
+            target = x_all[:, -1, :]          # [N, d_in] last step
             recon_loss = self.recon_loss_fn(x_hat_all, target)
 
             residuals = x_hat_all - target
             anomaly_logit = torch.norm(residuals, dim=1)
-
             cls_loss = self.cls_loss_fn(anomaly_logit, labels)
 
             loss = recon_loss + 0.5 * cls_loss
 
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), 1.0)
-
             self.optimizer.step()
 
             total_loss += loss.item()
             n_steps += 1
 
         return total_loss / max(n_steps, 1)
+
     # ── VALIDATION ───────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def _validate(self, val_dataset) -> Tuple[float, float]:
-
         from collections import defaultdict
         from utils.metrics import compute_f1, compute_auc_pr
 
         self.backbone.eval()
-
         all_scores = []
         all_labels = []
 
-        # Group samples by timestep
+        # Group indices using lightweight tuples
         t_buckets = defaultdict(list)
-
         for i in range(len(val_dataset)):
-            sample = val_dataset[i]
-            t_buckets[int(sample["t"])].append(sample)
+            node_id, t, label = val_dataset.as_tuples[i]
+            t_buckets[t].append(i)
 
-        for t, samples in t_buckets.items():
+        for t, idxs in t_buckets.items():
+            
+            samples = [val_dataset[i] for i in idxs]
 
             N = self.backbone.num_nodes
             W = samples[0]["x_window"].shape[0]
             d_in = samples[0]["x_window"].shape[1]
 
-            x_all = torch.zeros(N, W, d_in)
+            x_all = torch.zeros(N, W, d_in, device=self.device)
             labels = torch.zeros(N)
 
             graph = samples[0]["graph"]
@@ -397,17 +578,13 @@ class Trainer:
 
             for s in samples:
                 nid = int(s["node_id"])
-                if nid >= N:
-                    continue
-
-                x_all[nid] = s["x_window"]
-                labels[nid] = s["label"]
-
-            x_all = x_all.to(self.device)
+                if nid < N:
+                    x_all[nid] = s["x_window"].to(self.device)
+                    labels[nid] = s["label"]
 
             _, x_hat_all = self.backbone(x_all, graph)
 
-            target = x_all[:, -1, :]   # last timestep — matches training target
+            target = x_all[:, -1, :]   
             scores = torch.norm(x_hat_all - target, dim=1)
 
             all_scores.extend(scores.cpu().tolist())

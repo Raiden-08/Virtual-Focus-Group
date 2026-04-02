@@ -2,4 +2,5 @@ rag/analysis/
 # Python cache
 __pycache__/
 *.py[cod]
-*$py.class
+*$py.classdata/raw/
+*.csv
