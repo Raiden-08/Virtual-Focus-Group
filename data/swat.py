@@ -189,9 +189,16 @@ def load_swat(data_dir: str = "data/raw",
     attack_df = safe_load(attack_path)
 
     # sensor columns = everything except timestamp + label
-    drop_cols = [c for c in [_TIMESTAMP_COL, _LABEL_COL]
-                 if c in normal_df.columns]
+    drop_cols = [c for c in [_TIMESTAMP_COL, _LABEL_COL] if c in normal_df.columns]
     feature_cols = [c for c in normal_df.columns if c not in drop_cols]
+
+    # --- THE NUKE: Force everything to numbers, turn strings to NaN, and drop them ---
+    normal_df[feature_cols] = normal_df[feature_cols].apply(pd.to_numeric, errors='coerce')
+    normal_df = normal_df.dropna(subset=feature_cols)
+    
+    attack_df[feature_cols] = attack_df[feature_cols].apply(pd.to_numeric, errors='coerce')
+    attack_df = attack_df.dropna(subset=feature_cols)
+    # ---------------------------------------------------------------------------------
 
     # normal data: all label = 0
     normal_signals = normal_df[feature_cols].values.astype(np.float32)
