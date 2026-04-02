@@ -45,13 +45,20 @@ def load_swat(data_dir: str = "data/raw",
             "Request access at https://itrust.sutd.edu.sg/itrust-labs_datasets/dataset_info/"
         )
 
-    # --- load ---
+    # --- load (auto-detect separator: semicolon or comma) ---
     normal_df = pd.read_csv(normal_path, sep=";", low_memory=False)
-    attack_df = pd.read_csv(attack_path, sep=";", low_memory=False)
-
-    # strip whitespace from column names
     normal_df.columns = normal_df.columns.str.strip()
+    if _LABEL_COL not in normal_df.columns and len(normal_df.columns) <= 2:
+        # semicolon didn't split properly → re-read as comma-separated
+        normal_df = pd.read_csv(normal_path, sep=",", low_memory=False)
+        normal_df.columns = normal_df.columns.str.strip()
+
+    attack_df = pd.read_csv(attack_path, sep=";", low_memory=False)
     attack_df.columns = attack_df.columns.str.strip()
+    if _LABEL_COL not in attack_df.columns and len(attack_df.columns) <= 2:
+        attack_df = pd.read_csv(attack_path, sep=",", low_memory=False)
+        attack_df.columns = attack_df.columns.str.strip()
+
 
     # sensor columns = everything except timestamp + label
     drop_cols = [c for c in [_TIMESTAMP_COL, _LABEL_COL]
