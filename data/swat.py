@@ -112,8 +112,6 @@
 #                                      graph=graph)
 
 #     return train_ds, val_ds, test_ds, feature_cols
-
-
 """
 swat.py — SWAT (Secure Water Treatment) dataset loader.
 Owned by Person 1.
@@ -163,12 +161,12 @@ def load_swat(data_dir: str = "data/raw",
 
     def safe_load(path):
         """Robust CSV loader to handle SWaT formatting quirks."""
-        # 1. Load with skipinitialspace to handle ' Timestamp' vs 'Timestamp'
-        df = pd.read_csv(path, sep=",", skipinitialspace=True, low_memory=False)
+        # 1. Load with header=1 to skip the 'Unnamed/P1' junk row
+        df = pd.read_csv(path, sep=",", skipinitialspace=True, low_memory=False, header=1)
         
         # 2. Fallback to semicolon if comma yielded 1 or 2 columns
         if len(df.columns) <= 2:
-            df = pd.read_csv(path, sep=";", skipinitialspace=True, low_memory=False)
+            df = pd.read_csv(path, sep=";", skipinitialspace=True, low_memory=False, header=1)
             
         df.columns = df.columns.str.strip()
         
@@ -188,9 +186,15 @@ def load_swat(data_dir: str = "data/raw",
     normal_df = safe_load(normal_path)
     attack_df = safe_load(attack_path)
 
-    # sensor columns = everything except timestamp + label
-    drop_cols = [c for c in [_TIMESTAMP_COL, _LABEL_COL] if c in normal_df.columns]
-    feature_cols = [c for c in normal_df.columns if c not in drop_cols]
+    # 1. Find the common columns that exist in BOTH files
+    common_cols = normal_df.columns.intersection(attack_df.columns)
+
+    # 2. Define what we want to drop
+    drop_candidates = [_TIMESTAMP_COL, _LABEL_COL, "Timestamp", "Normal/Attack"]
+    drop_cols = [c for c in drop_candidates if c in common_cols]
+    
+    # 3. Only keep features that are in both files AND aren't the timestamp/label
+    feature_cols = [c for c in common_cols if c not in drop_cols]
 
     # --- THE NUKE: Force everything to numbers, turn strings to NaN, and drop them ---
     normal_df[feature_cols] = normal_df[feature_cols].apply(pd.to_numeric, errors='coerce')
