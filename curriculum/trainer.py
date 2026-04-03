@@ -11,7 +11,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data, Batch
 from torch.utils.data import Subset
 from typing import Dict, List, Tuple, Optional
-from curriculum.scheduler import get_batch, pacing
+from curriculum.scheduler import get_batch, get_batch_fast, pacing
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,11 +19,11 @@ from curriculum.scheduler import get_batch, pacing
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MockBackbone(nn.Module):
-    def __init__(self, d_in: int = 10, d_z: int = 64):
+    def __init__(self, d_in: int = 10, d_z: int = 64, num_nodes: int = 10):
         super().__init__()
         self.d_in = d_in
         self.d_z = d_z
-        self.num_nodes = 51
+        self.num_nodes = num_nodes
         self.lstm_mock  = nn.Linear(d_in, d_z)
         self.recon_mock = nn.Linear(d_z, d_in)
 
@@ -36,12 +36,23 @@ class MockBackbone(nn.Module):
     def forward(self, x_windows, graph=None):
         """
         Batched forward for GPU efficiency.
-        x_windows : [B, W, d_in]
-        returns   : z_all [B, d_z],  x_hat_all [B, d_in]
+        Supports x_windows : [B*N, W, d_in] or [B, N, W, d_in].
         """
-        x_flat    = x_windows.mean(dim=1)                        # [B, d_in]
-        z_all     = torch.relu(self.lstm_mock(x_flat))           # [B, d_z]
-        x_hat_all = self.recon_mock(z_all)                       # [B, d_in]
+        is_batched = (x_windows.dim() == 4)
+        if is_batched:
+            B, N_dim, W, d_in = x_windows.shape
+            x_windows = x_windows.view(B * N_dim, W, d_in)
+        else:
+            N_dim = x_windows.shape[0]
+            
+        x_last    = x_windows[:, -1, :]                          # [B*N, d_in]
+        z_all     = torch.relu(self.lstm_mock(x_last))           # [B*N, d_z]
+        x_hat_all = self.recon_mock(z_all)                       # [B*N, d_in]
+        
+        if is_batched:
+            z_all = z_all.view(B, N_dim, -1)
+            x_hat_all = x_hat_all.view(B, N_dim, -1)
+            
         return z_all, x_hat_all
 
 
@@ -71,7 +82,10 @@ class MockTemporalGraphDataset(torch.utils.data.Dataset):
         super().__init__()
         rng = np.random.RandomState(seed)
         self.window_size = window_size
+        self.window = window_size
         self.d_in = d_in
+        self.N = n_nodes
+        self.graph = None
 
         raw    = rng.randn(n_nodes, T + window_size, d_in).astype(np.float32)
         labels = np.zeros((n_nodes, T), dtype=np.int64)
@@ -81,16 +95,40 @@ class MockTemporalGraphDataset(torch.utils.data.Dataset):
             labels[n, anomaly_times] = 1
 
         self.samples = []
-        for n in range(n_nodes):
-            for t in range(T):
+        
+        # BaseTimeSeriesDataset structure: group by time, then tile by node
+        # _index_t = np.repeat(times, N)
+        # _index_v = np.tile(nodes, T)
+        t_values = np.arange(T, dtype=np.int32)
+        node_ids_arr = np.arange(n_nodes, dtype=np.int32)
+        
+        self._index_t = np.repeat(t_values, n_nodes)
+        self._index_v = np.tile(node_ids_arr, T)
+        
+        # Build samples in the exact same order
+        target_list = []
+        for t in range(T):
+            for n in range(n_nodes):
                 window = raw[n, t: t + window_size]
+                w_tensor = torch.tensor(window)
+                # Target = next value after window (forecast target)
+                target_val = raw[n, t + window_size]  # [d_in]
                 self.samples.append({
-                    "x_window": torch.tensor(window),
+                    "x_window": w_tensor,
+                    "target":   torch.tensor(target_val),
                     "node_id":  n,
                     "t":        t,
                     "label":    int(labels[n, t]),
                     "graph":    None
                 })
+                target_list.append(torch.tensor(target_val))
+
+        self._precomputed_labels = np.array([s["label"] for s in self.samples], dtype=np.int64)
+        self._precomputed_windows = torch.stack([s["x_window"] for s in self.samples])
+        self._precomputed_targets = torch.stack(target_list)  # [n_samples, d_in]
+
+
+
 
         self.as_tuples = [
             (s["node_id"], s["t"], s["label"]) for s in self.samples
@@ -155,7 +193,12 @@ class Trainer:
         use_curriculum: bool = True,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
+        self.raw_backbone   = backbone
         self.backbone       = backbone.to(device)
+        if device == "cuda" and torch.cuda.device_count() > 1:
+            self.backbone = nn.DataParallel(self.backbone)
+            print(f"[Trainer] Using {torch.cuda.device_count()} GPUs via DataParallel")
+            
         self.rag_scorer     = rag_scorer
         self.dataset        = dataset
         self.config         = config
@@ -169,7 +212,6 @@ class Trainer:
         )
 
         self.recon_loss_fn = nn.MSELoss()
-        self.cls_loss_fn   = nn.BCEWithLogitsLoss()
 
         self.history = {
             "train_loss": [],
@@ -199,103 +241,186 @@ class Trainer:
 
     # ── HARDNESS SCORING ─────────────────────────────────────────────────────
 
-    def _compute_all_hardness_scores(self) -> Dict[Tuple, float]:
-        print("[Trainer] Pre-computing hardness scores...")
-        t0     = time.time()
-        scores = self.rag_scorer.get_all_scores(self.dataset.as_tuples)
-        vals   = list(scores.values())
-        print(f"[Trainer] Scored {len(scores)} samples in {time.time()-t0:.2f}s  "
-              f"mean={np.mean(vals):.3f}  std={np.std(vals):.3f}")
+    @torch.no_grad()
+    def _compute_hardness_from_loss(self) -> np.ndarray:
+        """
+        Compute per-sample hardness from reconstruction error.
+        
+        Returns numpy array [n_samples] with scores in [0, 1].
+        Higher score = larger reconstruction error = harder sample.
+        """
+        print("[Trainer] Computing hardness scores from reconstruction loss...")
+        t0 = time.time()
+        
+        ds = self.dataset
+        N = self.raw_backbone.num_nodes
+        n_samples = len(ds)
+        n_times = n_samples // N
+        batch_size = self.config.get("batch_size", 64)
+        graph = ds.graph
+        
+        self.backbone.eval()
+        all_errors = torch.zeros(n_samples)
+        
+        # We no longer pre-build PyG Batches. Backbone handles it.
+        # Ensure graph is not None for dummy fallback uses
+        graph = ds.graph if ds.graph is not None else Data(edge_index=torch.empty((2, 0), dtype=torch.long))
+
+        use_amp = (self.device != "cpu")
+        
+        for ti_start in range(0, n_times, batch_size):
+            ti_end = min(ti_start + batch_size, n_times)
+            B = ti_end - ti_start
+            idx_start = ti_start * N
+            idx_end = ti_end * N
+            
+            x_all = ds._precomputed_windows[idx_start:idx_end].to(
+                self.device, non_blocking=True)
+            
+            x_all_reshaped = x_all.view(B, N, -1, x_all.shape[-1])
+            
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                _, x_hat_all = self.backbone(x_all_reshaped, graph)
+                
+            x_hat_all = x_hat_all.view(B * N, -1)
+            # Forecast target: signals[t] — one step AFTER the window
+            target = ds._precomputed_targets[idx_start:idx_end].to(
+                self.device, non_blocking=True)
+            errors = torch.norm(x_hat_all - target, dim=1)
+            all_errors[idx_start:idx_end] = errors.cpu()
+        
+        self.backbone.train()
+        
+        # Normalize to [0, 1]
+        e_min = all_errors.min().item()
+        e_max = all_errors.max().item()
+        scores = ((all_errors - e_min) / (e_max - e_min + 1e-8)).numpy()
+        
+        print(f"[Trainer] Scored {n_samples:,} samples in {time.time()-t0:.1f}s  "
+              f"mean={scores.mean():.3f}  std={scores.std():.3f}")
         return scores
 
     # ── SINGLE EPOCH ─────────────────────────────────────────────────────────
 
-    def _train_epoch(self, indices: List[int], batch_size: int) -> float:
-
-        from collections import defaultdict
+    def _train_epoch(self, indices, batch_size: int) -> float:
 
         self.backbone.train()
 
         total_loss = 0.0
         n_steps = 0
 
-        # --------------------------------------------------
-        # Group samples by timestep
-        # --------------------------------------------------
-
-        t_buckets = defaultdict(list)
-
-        for idx in indices:
-            sample = self.dataset[idx]
-
-            t_buckets[int(sample["t"])].append(sample)
+        ds = self.dataset
+        N = self.raw_backbone.num_nodes
+        W = ds.window
+        d_in = ds._precomputed_windows.shape[-1]
+        graph = ds.graph
 
         # --------------------------------------------------
-        # Train one timestep at a time
+        # Pre-sort indices by timestep ONCE — O(N log N)
+        # Then each batch is a contiguous slice — O(1)
+        # This replaces the old O(N * num_batches) mask scan.
         # --------------------------------------------------
+        indices_arr = np.asarray(indices, dtype=np.int64)
+        times = ds._index_t[indices_arr]
+        sort_order = np.argsort(times, kind='mergesort')
+        sorted_indices = indices_arr[sort_order]
+        sorted_times = times[sort_order]
 
-        for t, samples in t_buckets.items():
+        # Find boundaries between unique timesteps
+        change_mask = np.empty(len(sorted_times), dtype=bool)
+        change_mask[0] = True
+        change_mask[1:] = sorted_times[1:] != sorted_times[:-1]
+        group_starts = np.where(change_mask)[0]
+        n_unique = len(group_starts)
+        # Append sentinel for easy slicing
+        group_starts = np.append(group_starts, len(sorted_indices))
 
-            N = self.backbone.num_nodes
-            W = samples[0]["x_window"].shape[0]
-            d_in = samples[0]["x_window"].shape[1]
+        # Append sentinel for easy slicing
+        group_starts = np.append(group_starts, len(sorted_indices))
 
-            x_all = torch.zeros(N, W, d_in)
-            labels = torch.zeros(N)
+        # We no longer pre-build PyG Batches. Backbone handles it.
+        # Fallback for mock dataset testing:
+        graph = ds.graph if ds.graph is not None else Data(edge_index=torch.empty((2, 0), dtype=torch.long))
 
-            graph = samples[0]["graph"]
-            if graph is not None:
-                graph = graph.to(self.device)
+        # AMP scaler for mixed precision
+        use_amp = (self.device != "cpu")
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-            for s in samples:
-                nid = int(s["node_id"])
+        # --------------------------------------------------
+        # Train batches of timesteps — contiguous slice per batch
+        # --------------------------------------------------
+        for gi_start in range(0, n_unique, batch_size):
+            gi_end = min(gi_start + batch_size, n_unique)
+            B = gi_end - gi_start
 
-                if nid >= N:
-                    continue
+            # Contiguous slice of all selected samples in this batch's timesteps
+            idx_lo = group_starts[gi_start]
+            idx_hi = group_starts[gi_end]
+            chunk_global_idx = sorted_indices[idx_lo:idx_hi]
 
-                x_all[nid] = s["x_window"]
-                labels[nid] = s["label"]
+            # The unique timesteps present in this chunk
+            unique_in_chunk = sorted_times[group_starts[gi_start:gi_end]]
 
-            x_all = x_all.to(self.device)
-            labels = labels.to(self.device)
+            # We MUST load all N nodes for these timesteps so the GNN has full context,
+            # otherwise unselected nodes would be zero-padded and corrupt the graph!
+            # The exact contiguous indices in the dataset for these full timesteps are:
+            # We map physical time t to block index k: k = (t - window) // stride
+            stride = getattr(ds, 'stride', 1)
+            k_values = (unique_in_chunk - W) // stride
+            base_idx = (k_values * N)[:, None]  # [B, 1]
+            node_offsets = np.arange(N)[None, :]       # [1, N]
+            full_t_indices = (base_idx + node_offsets).flatten() # [B * N]
 
-            if graph is not None: graph = graph.to(self.device)
+            x_all = ds._precomputed_windows[full_t_indices].to(
+                self.device, non_blocking=True)
 
-            self.optimizer.zero_grad()
+            # Which timestep-group does each *selected* sample belong to? (0..B-1)
+            chunk_times = sorted_times[idx_lo:idx_hi]
+            batch_offset = np.searchsorted(unique_in_chunk, chunk_times)
 
-            # -----------------------------
-            # Forward pass
-            # -----------------------------
+            # Flat indices into the [B*N] batch for the *selected* nodes only
+            nids = ds._index_v[chunk_global_idx].astype(np.int64)
+            selected_flat_indices = torch.from_numpy(batch_offset * N + nids).long().to(self.device)
 
-            z_all, x_hat_all = self.backbone(x_all, graph)
+            self.optimizer.zero_grad(set_to_none=True)
 
-            target = x_all.mean(dim=1)
+            x_all_reshaped = x_all.view(B, N, W, d_in)
 
-            recon_loss = self.recon_loss_fn(x_hat_all, target)
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                # DataParallel splits gracefully along B dimension
+                z_all, x_hat_all = self.backbone(x_all_reshaped, graph)
+                
+                # Flatten the outputs back to [B*N, ...]
+                z_all = z_all.view(B * N, -1)
+                x_hat_all = x_hat_all.view(B * N, -1)
+                
+                # Forecast target: signals[t] — one step AFTER the window
+                target = ds._precomputed_targets[full_t_indices].to(
+                    self.device, non_blocking=True)
+                
+                # ONLY compute loss on the nodes selected by the curriculum!
+                # If we compute it on all B*N nodes, curriculum is defeated.
+                loss = self.recon_loss_fn(
+                    x_hat_all[selected_flat_indices], 
+                    target[selected_flat_indices]
+                )
 
-            residuals = x_hat_all - target
-            anomaly_logit = torch.norm(residuals, dim=1)
-
-            cls_loss = self.cls_loss_fn(anomaly_logit, labels)
-
-            loss = recon_loss + 0.5 * cls_loss
-
-            loss.backward()
-
+            scaler.scale(loss).backward()
+            scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), 1.0)
-
-            self.optimizer.step()
+            scaler.step(self.optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             n_steps += 1
 
         return total_loss / max(n_steps, 1)
+
     # ── VALIDATION ───────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def _validate(self, val_dataset) -> Tuple[float, float]:
 
-        from collections import defaultdict
         from utils.metrics import compute_f1, compute_auc_pr
 
         self.backbone.eval()
@@ -303,43 +428,44 @@ class Trainer:
         all_scores = []
         all_labels = []
 
-        # Group samples by timestep
-        t_buckets = defaultdict(list)
+        N = self.raw_backbone.num_nodes
+        graph = val_dataset.graph
+        n_samples = len(val_dataset)
+        n_times = n_samples // N
+        batch_size = self.config.get("batch_size", 64)
 
-        for i in range(len(val_dataset)):
-            sample = val_dataset[i]
-            t_buckets[int(sample["t"])].append(sample)
+        # We no longer pre-build PyG Batches.
+        graph = val_dataset.graph if val_dataset.graph is not None else Data(edge_index=torch.empty((2, 0), dtype=torch.long))
 
-        for t, samples in t_buckets.items():
+        use_amp = (self.device != "cpu")
 
-            N = self.backbone.num_nodes
-            W = samples[0]["x_window"].shape[0]
-            d_in = samples[0]["x_window"].shape[1]
+        # Data is ordered by timestep: indices [ti*N : (ti+1)*N] = timestep ti
+        for ti_start in range(0, n_times, batch_size):
+            ti_end = min(ti_start + batch_size, n_times)
+            B = ti_end - ti_start
 
-            x_all = torch.zeros(N, W, d_in)
-            labels = torch.zeros(N)
+            idx_start = ti_start * N
+            idx_end = ti_end * N
 
-            graph = samples[0]["graph"]
-            if graph is not None:
-                graph = graph.to(self.device)
+            # Single contiguous slice — no Python loop!
+            x_all = val_dataset._precomputed_windows[idx_start:idx_end].to(
+                self.device, non_blocking=True)
+            chunk_labels = val_dataset._precomputed_labels[idx_start:idx_end]
 
-            for s in samples:
-                nid = int(s["node_id"])
-                if nid >= N:
-                    continue
+            x_all_reshaped = x_all.view(B, N, -1, x_all.shape[-1])
 
-                x_all[nid] = s["x_window"]
-                labels[nid] = s["label"]
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                _, x_hat_all = self.backbone(x_all_reshaped, graph)
+                
+            x_hat_all = x_hat_all.view(B * N, -1)
 
-            x_all = x_all.to(self.device)
-
-            _, x_hat_all = self.backbone(x_all, graph)
-
-            target = x_all.mean(dim=1)
+            # Forecast target: signals[t] — one step AFTER the window
+            target = val_dataset._precomputed_targets[idx_start:idx_end].to(
+                self.device, non_blocking=True)
             scores = torch.norm(x_hat_all - target, dim=1)
 
             all_scores.extend(scores.cpu().tolist())
-            all_labels.extend(labels.tolist())
+            all_labels.extend(chunk_labels.tolist())
 
         return compute_f1(all_scores, all_labels), compute_auc_pr(all_scores, all_labels)
     
@@ -354,14 +480,18 @@ class Trainer:
         batch_size = self.config.get("batch_size", 64)
         best_f1    = -1.0
         best_epoch = -1
+        n_samples  = len(self.dataset)
 
+        # ── Cosine annealing LR scheduler ───────────────────────────────
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=epochs, eta_min=1e-5
+        )
+
+        # ── Initial hardness scores (numpy array) ───────────────────────
         if self.use_curriculum:
-            hardness_scores = self._compute_all_hardness_scores()
+            hardness_array = self._compute_hardness_from_loss()
         else:
-            hardness_scores = {
-                (node_id, t): 0.0
-                for (node_id, t, _) in self.dataset.as_tuples
-            }
+            hardness_array = np.zeros(n_samples, dtype=np.float32)
 
         print(f"\n[Trainer] Starting training for {epochs} epochs...")
         print("-" * 60)
@@ -371,17 +501,17 @@ class Trainer:
             t_start = time.time()
 
             if self.use_curriculum:
-                indices = get_batch(
-                    self.dataset.as_tuples,
-                    hardness_scores,
-                    epoch,
-                    k_warmup,
-                    verbose=False
+                indices = get_batch_fast(
+                    hardness_array, epoch, k_warmup, verbose=False
                 )
+                # Recompute hardness every 10 epochs (curriculum adapts)
+                if epoch > 0 and epoch % 10 == 0:
+                    hardness_array = self._compute_hardness_from_loss()
             else:
-                indices = list(range(len(self.dataset)))
+                indices = np.arange(n_samples)
 
             train_loss = self._train_epoch(indices, batch_size)
+            lr_scheduler.step()
 
             epoch_time = time.time() - t_start
 
@@ -406,7 +536,7 @@ class Trainer:
                         "config": self.config
                     }, ckpt_path)
 
-            pct = 100 * len(indices) / len(self.dataset)
+            pct = 100 * len(indices) / n_samples
             lam = pacing(epoch, k_warmup)
 
             self.history["train_loss"].append(train_loss)
@@ -416,12 +546,14 @@ class Trainer:
             self.history["pct_data"].append(pct)
 
             if epoch % 5 == 0 or epoch == epochs - 1:
+                lr_now = lr_scheduler.get_last_lr()[0]
                 print(
                     f"Epoch {epoch:4d}/{epochs} | "
                     f"λ={lam:.3f} | "
                     f"data={pct:5.1f}% | "
                     f"loss={train_loss:.4f} | "
                     f"F1={f1:.4f} AUC-PR={auc_pr:.4f} | "
+                    f"lr={lr_now:.6f} | "
                     f"{epoch_time:.1f}s"
                 )
 
@@ -477,11 +609,11 @@ def compute_auc_pr(scores, labels):
     scorer   = MockRAGScorer(seed=42)
 
     print("\n--- Baseline (no curriculum) ---")
-    t1 = Trainer(MockBackbone(d_in=8, d_z=32), scorer, train_ds, CONFIG, use_curriculum=False)
+    t1 = Trainer(MockBackbone(d_in=8, d_z=32, num_nodes=5), scorer, train_ds, CONFIG, use_curriculum=False)
     h1 = t1.train(val_dataset=val_ds, save_dir="checkpoints/baseline")
 
     print("\n--- RC-TGAD (curriculum ON) ---")
-    t2 = Trainer(MockBackbone(d_in=8, d_z=32), scorer, train_ds, CONFIG, use_curriculum=True)
+    t2 = Trainer(MockBackbone(d_in=8, d_z=32, num_nodes=5), scorer, train_ds, CONFIG, use_curriculum=True)
     h2 = t2.train(val_dataset=val_ds, save_dir="checkpoints/rctgad")
 
     print(f"\nBaseline F1 : {h1['val_f1'][-1]:.4f}")

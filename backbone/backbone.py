@@ -75,27 +75,42 @@ class Backbone(nn.Module):
     def forward(self, x_windows: torch.Tensor,
                 graph: Data) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Process a full batch of node windows for a single timestep.
-
-        Args:
-            x_windows : Tensor [N, W, d_in]  one window per node
-            graph     : torch_geometric Data  static graph
-
-        Returns:
-            z_all     : Tensor [N, gnn_out_dim]  joint embeddings
-            x_hat_all : Tensor [N, d_in]         reconstructions
+        Process a full batch of node windows.
+        Supports single graph [N, W, d_in] or batched graphs [B, N, W, d_in].
         """
-        N = x_windows.shape[0]
+        is_batched = (x_windows.dim() == 4)
+        if is_batched:
+            B, N_dim, W, d_in = x_windows.shape
+            x_windows = x_windows.view(B * N_dim, W, d_in)
+        else:
+            N_dim = x_windows.shape[0]
 
-        # LSTM: process all nodes in one batched call
-        h_all, x_hat_all = self.lstm(x_windows)    # [N, hidden], [N, d_in]
+        # LSTM: process all nodes
+        h_all, x_hat_all = self.lstm(x_windows)    # [B*N, hidden], [B*N, d_in]
+
+        # Build edge_index for the GAT natively on this device
+        device = x_windows.device
+        base_edge_index = graph.edge_index.to(device)
+        
+        if is_batched:
+            E = base_edge_index.shape[1]
+            edge_index = base_edge_index.repeat(1, B)
+            offsets = torch.arange(B, device=device).view(B, 1).repeat(1, E).view(-1) * N_dim
+            edge_index = edge_index + offsets
+            
+            edge_attr = None
+            if graph.edge_attr is not None:
+                edge_attr = graph.edge_attr.to(device).repeat(B, 1)
+        else:
+            edge_index = base_edge_index
+            edge_attr = graph.edge_attr.to(device) if graph.edge_attr is not None else None
 
         # GNN: reason over node embeddings
-        edge_index = graph.edge_index.to(x_windows.device)
-        edge_attr  = graph.edge_attr.to(x_windows.device) \
-            if graph.edge_attr is not None else None
+        z_all = self.gnn(h_all, edge_index, edge_attr)   # [B*N, gnn_out_dim]
 
-        z_all = self.gnn(h_all, edge_index, edge_attr)   # [N, gnn_out_dim]
+        if is_batched:
+            z_all = z_all.view(B, N_dim, -1)
+            x_hat_all = x_hat_all.view(B, N_dim, -1)
 
         return z_all, x_hat_all
 

@@ -3,3 +3,9 @@ rag/analysis/
 __pycache__/
 *.py[cod]
 *$py.class
+data/
+*.npy
+*.csv
+*.zip
+checkpoints/
+results/

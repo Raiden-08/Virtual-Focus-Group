@@ -12,7 +12,7 @@ model:
   dropout:        0.1
   window_size:    30
   d_in:           1         # Person 1: univariate per node (d_in=1 from base_dataset.py)
-  num_nodes:      55        # 51 for SWAT | 55 for SMAP and MSL — override per run
+  num_nodes:      51        # auto-detected from dataset at runtime; 51 SWAT, 55 SMAP
 
 # ─────────────────────────────────────────────────────────
 # RAG  (Person 2 owns these)
@@ -39,7 +39,7 @@ curriculum:
 # ─────────────────────────────────────────────────────────
 training:
   epochs:         100
-  batch_size:     64
+  batch_size:     512
   lr:             0.001
   weight_decay:   0.00001
   grad_clip:      1.0

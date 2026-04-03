@@ -9,6 +9,11 @@ Download instructions:
 Expected files after download:
   data/raw/SWaT_Dataset_Normal_v1.csv
   data/raw/SWaT_Dataset_Attack_v0.csv
+
+Data split (standard benchmark):
+  Train: ALL normal data       — model learns normal patterns
+  Val:   first val_ratio of attack data — has anomalies for model selection
+  Test:  remaining attack data — final evaluation
 """
 
 import os
@@ -26,10 +31,14 @@ _TIMESTAMP_COL = "Timestamp"
 def load_swat(data_dir: str = "data/raw",
               window: int = 30,
               stride: int = 1,
-              train_ratio: float = 0.6,
-              val_ratio: float = 0.1):
+              val_ratio: float = 0.15):
     """
     Load SWAT CSVs and return train / val / test BaseTimeSeriesDataset splits.
+
+    Standard benchmark split:
+      - Train: ALL normal data (learn normal patterns)
+      - Val:   first val_ratio of attack data (anomalies for model selection)
+      - Test:  remaining attack data (final evaluation)
 
     Returns:
         train_ds, val_ds, test_ds : BaseTimeSeriesDataset
@@ -46,8 +55,8 @@ def load_swat(data_dir: str = "data/raw",
         )
 
     # --- load ---
-    normal_df = pd.read_csv(normal_path, sep=";", low_memory=False)
-    attack_df = pd.read_csv(attack_path, sep=";", low_memory=False)
+    normal_df = pd.read_csv(normal_path, sep=",", header=1, low_memory=False)
+    attack_df = pd.read_csv(attack_path, sep=",", header=1, low_memory=False)
 
     # strip whitespace from column names
     normal_df.columns = normal_df.columns.str.strip()
@@ -58,48 +67,62 @@ def load_swat(data_dir: str = "data/raw",
                  if c in normal_df.columns]
     feature_cols = [c for c in normal_df.columns if c not in drop_cols]
 
-    # normal data: all label = 0
+    # ── normal data: all label = 0 ──────────────────────────────────────
     normal_signals = normal_df[feature_cols].values.astype(np.float32)
     normal_labels  = np.zeros_like(normal_signals, dtype=np.int64)
 
-    # attack data: label column "Attack" / "Normal"
+    # ── attack data: label column "Attack" / "Normal" ───────────────────
     attack_signals = attack_df[feature_cols].values.astype(np.float32)
     raw_labels     = attack_df[_LABEL_COL].str.strip().values
-    # broadcast the row label to all nodes
     row_labels     = (raw_labels != "Normal").astype(np.int64)
     attack_labels  = np.broadcast_to(
         row_labels[:, None], attack_signals.shape).copy()
 
-    # --- split normal into train / val ---
-    T_n = len(normal_signals)
-    t_train = int(T_n * train_ratio)
-    t_val   = int(T_n * (train_ratio + val_ratio))
+    # ── Split: Train/Val/Test completely from contaminated Attack DB ────
+    # Discard normal DB entirely. Curriculum requires noisy training sets!
+    T_a = len(attack_signals)
+    
+    # 60% Train, 15% Val, 25% Test
+    t_train_end = int(T_a * 0.60)
+    t_val_end   = int(T_a * (0.60 + val_ratio))
+    
+    train_sig = attack_signals[:t_train_end]
+    train_lbl = attack_labels[:t_train_end]
+    
+    val_sig   = attack_signals[t_train_end:t_val_end]
+    val_lbl   = attack_labels[t_train_end:t_val_end]
+    
+    test_sig  = attack_signals[t_val_end:]
+    test_lbl  = attack_labels[t_val_end:]
 
-    train_sig = normal_signals[:t_train]
-    train_lbl = normal_labels[:t_train]
+    # ── Compute normalization stats strictly from Train split ───────────
+    train_mean = train_sig.mean(axis=0)         # [N]
+    train_std  = train_sig.std(axis=0) + 1e-8   # [N]
 
-    val_sig   = normal_signals[t_train:t_val]
-    val_lbl   = normal_labels[t_train:t_val]
-
-    # test = remaining normal + all attack
-    test_sig  = np.concatenate([normal_signals[t_val:], attack_signals])
-    test_lbl  = np.concatenate([normal_labels[t_val:],  attack_labels])
-
-    # build graph from training signals (after normalisation inside dataset)
-    # graph is shared across splits — built on train stats
-    tmp_mean = train_sig.mean(0)
-    tmp_std  = train_sig.std(0) + 1e-8
-    train_norm = (train_sig - tmp_mean) / tmp_std
+    # ── Build graph from normalized training signals ────────────────────
+    train_norm = (train_sig - train_mean) / train_std
     graph = build_graph_from_correlation(train_norm, threshold=0.5)
 
+    print(f"[SWaT] Train: {len(train_sig):,} timesteps "
+          f"({train_lbl.max(axis=1).sum():,} anomalous rows / {train_lbl.max(axis=1).mean()*100:.1f}%)")
+    print(f"[SWaT] Val:   {len(val_sig):,} timesteps "
+          f"({val_lbl.max(axis=1).sum():,} anomalous rows / {val_lbl.max(axis=1).mean()*100:.1f}%)")
+    print(f"[SWaT] Test:  {len(test_sig):,} timesteps "
+          f"({test_lbl.max(axis=1).sum():,} anomalous rows / {test_lbl.max(axis=1).mean()*100:.1f}%)")
+
+    # ── Create datasets (val/test use training stats for normalization) ──
     train_ds = BaseTimeSeriesDataset(train_sig, train_lbl,
                                      window=window, stride=stride,
                                      graph=graph)
     val_ds   = BaseTimeSeriesDataset(val_sig,   val_lbl,
                                      window=window, stride=stride,
-                                     graph=graph)
+                                     graph=graph,
+                                     norm_mean=train_mean,
+                                     norm_std=train_std)
     test_ds  = BaseTimeSeriesDataset(test_sig,  test_lbl,
                                      window=window, stride=stride,
-                                     graph=graph)
+                                     graph=graph,
+                                     norm_mean=train_mean,
+                                     norm_std=train_std)
 
     return train_ds, val_ds, test_ds, feature_cols

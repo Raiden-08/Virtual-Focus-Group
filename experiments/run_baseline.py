@@ -99,6 +99,10 @@ def load_dataset(cfg, seed, mock=False):
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
+    # Auto-detect num_nodes from actual data (prevents SMAP/SWAT mismatch)
+    cfg["model"]["num_nodes"] = train_data.N
+    print(f"[Dataset] Auto-detected num_nodes = {train_data.N}")
+
     # Attach .as_tuples — curriculum scheduler needs (node_id, t, label) list.
     # Person 1's dataset exposes as_flat_list() for exactly this purpose.
     train_data.as_tuples = train_data.as_flat_list()
@@ -117,7 +121,8 @@ def load_backbone(cfg, mock=False):
     if mock:
         return MockBackbone(
             d_in=cfg["model"]["d_in"],
-            d_z=cfg["model"]["gnn_out_dim"]
+            d_z=cfg["model"]["gnn_out_dim"],
+            num_nodes=10   # matches MockTemporalGraphDataset default
         )
     # ── REAL MODE ─────────────────────────────────────────────────────────────
     from backbone.backbone import Backbone
@@ -166,6 +171,7 @@ def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
         def mock_collate(batch):
             return {
                 "x_window": torch.stack([b["x_window"] for b in batch]),
+                "target":   torch.stack([b["target"] for b in batch]) if "target" in batch[0] else torch.stack([b["x_window"][:, -1, :] for b in batch]),
                 "label": torch.tensor([b["label"] for b in batch]),
                 "node_id": [b["node_id"] for b in batch],
                 "t": [b["t"] for b in batch],
@@ -183,12 +189,12 @@ def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
             for batch in loader:
 
                 x_window = batch["x_window"].to(device, non_blocking=True)   # [B,W,d_in]
+                target   = batch["target"].to(device, non_blocking=True) # [B,d_in]
                 labels   = batch["label"]
 
                 # Batched GPU forward pass
                 _, x_hat_all = backbone(x_window, None)                      # [B,d_in]
 
-                target = x_window.mean(dim=1)                                 # [B,d_in]
                 scores = torch.norm(x_hat_all - target, dim=1)                # [B]
 
                 all_scores.extend(scores.cpu().tolist())
@@ -197,62 +203,46 @@ def evaluate_on_test(backbone, test_dataset, cfg, device) -> dict:
     # ───────────────── REAL DATASET PATH ─────────────────
     else:
 
-        loader = DataLoader(
-            test_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=lambda x: x[0]
-        )
-
-        # Group samples by timestep
-        t_buckets = defaultdict(list)
-        graph = None
-
         with torch.no_grad():
+            from torch_geometric.data import Batch, Data
 
-            for sample in loader:
+            # Use raw module if wrapped in DataParallel
+            backbone_module = backbone.module if isinstance(backbone, torch.nn.DataParallel) else backbone
+            N = backbone_module.num_nodes
+            
+            n_samples = len(test_dataset)
+            n_times = n_samples // N
+            batch_size = cfg["training"].get("batch_size", 512)
+            graph = test_dataset.graph if test_dataset.graph is not None else Data(edge_index=torch.empty((2, 0), dtype=torch.long))
+            use_amp = (device != "cpu")
 
-                t       = int(sample["t"])
-                node_id = int(sample["node_id"])
-                label   = int(sample["label"])
-                x_win   = sample["x_window"]
+            # Data is ordered by timestep — slice directly
+            for ti_start in range(0, n_times, batch_size):
+                ti_end = min(ti_start + batch_size, n_times)
+                B = ti_end - ti_start
 
-                if graph is None:
-                    graph = sample["graph"]
+                idx_start = ti_start * N
+                idx_end = ti_end * N
 
-                t_buckets[t].append({
-                    "node_id": node_id,
-                    "x_window": x_win,
-                    "label": label
-                })
+                x_all = test_dataset._precomputed_windows[idx_start:idx_end].to(
+                    device, non_blocking=True)
+                chunk_labels = test_dataset._precomputed_labels[idx_start:idx_end]
 
-            N = cfg["model"]["num_nodes"]
+                x_all_reshaped = x_all.view(B, N, -1, x_all.shape[-1])
 
-            for t, node_samples in sorted(t_buckets.items()):
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    z_all, x_hat_all = backbone(x_all_reshaped, graph)
 
-                W    = cfg["model"]["window_size"]
-                d_in = cfg["model"]["d_in"]
+                x_hat_all = x_hat_all.view(B * N, -1)
+                
+                # Forecast target: signals[t] — one step AFTER the window
+                target = test_dataset._precomputed_targets[idx_start:idx_end].to(
+                    device, non_blocking=True)
+                
+                scores = torch.norm(x_hat_all - target, dim=1)
 
-                x_all = torch.zeros(N, W, d_in)
-                node_map = {}
-
-                for s in node_samples:
-                    nid = s["node_id"]
-                    x_all[nid] = s["x_window"]
-                    node_map[nid] = s["label"]
-
-                x_all = x_all.to(device)
-
-                z_all, x_hat_all = backbone(x_all, graph)
-
-                for nid, label in node_map.items():
-                    score = torch.norm(
-                        x_hat_all[nid] - x_all[nid].mean(dim=0)
-                    ).item()
-
-                    all_scores.append(score)
-                    all_labels.append(label)
+                all_scores.extend(scores.cpu().tolist())
+                all_labels.extend(chunk_labels.tolist())
 
     return evaluate(all_scores, all_labels, verbose=False)
 
