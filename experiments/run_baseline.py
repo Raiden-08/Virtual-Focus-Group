@@ -11,12 +11,16 @@ def load_dataset(cfg, seed, mock=False):
     dataset_name = cfg['data']['dataset']
     data_dir = cfg['data']['data_dir']
     window = cfg['model']['window_size']
+    
     if dataset_name == 'swat':
-        return load_swat(data_dir=data_dir, window=window)
+        datasets = load_swat(data_dir=data_dir, window=window)
     elif dataset_name == 'smap':
-        return load_smap(data_dir=data_dir, window=window)
+        datasets = load_smap(data_dir=data_dir, window=window)
     else:
         raise ValueError(f"Unknown dataset {dataset_name}")
+        
+    # ⚡ SQUASH THE BUG: Only return the first 3 items (train, val, test)
+    return datasets[:3]
 
 def load_backbone(cfg, device="cuda", mock=False):
     if mock:
