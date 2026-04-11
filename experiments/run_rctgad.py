@@ -28,10 +28,6 @@ from experiments.run_baseline import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ARGUMENT PARSER
-# ─────────────────────────────────────────────────────────────────────────────
-
 def parse_args():
     parser = argparse.ArgumentParser(description="RC-TGAD Full Model Runner")
     parser.add_argument("--config",   type=str,  default="configs/default.yaml")
@@ -44,35 +40,12 @@ def parse_args():
     return parser.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RAG SCORER ADAPTER
-#
-# WHY THIS EXISTS:
-#   Person 2's score_hardness() is a plain FUNCTION (not a class), and it
-#   takes extra stateful args: window_errors (running list) and vector_store.
-#   Your trainer.py expects an object with .score_hardness() and .get_all_scores()
-#   — the Interface B contract.
-#
-#   This adapter wraps Person 2's function into the class interface your
-#   trainer already expects. Zero changes needed in trainer.py.
-# ─────────────────────────────────────────────────────────────────────────────
-
 class RealRAGScorer:
-    """
-    Adapter that wraps Person 2's score_hardness() function into the
-    Interface B class contract that trainer.py expects.
-
-    Owns:
-      - VectorStore instance (FAISS index)
-      - window_errors running list
-      - alpha weights and k_neighbors from config
-    """
-
     def __init__(self, cfg: dict):
         from rag.vector_store import VectorStore
 
         self.vector_store   = VectorStore(dim=cfg["rag"]["vector_dim"])
-        self.window_errors  = []           # grows throughout training
+        self.window_errors  = []           
         self.alphas         = (
             cfg["rag"]["alpha_1"],
             cfg["rag"]["alpha_2"],
@@ -83,10 +56,6 @@ class RealRAGScorer:
 
     def score_hardness(self, z, x, x_hat, node_id, graph, t, 
                        ground_truth_label=0, **kwargs) -> float:
-        """
-        FIX: Removed hardcoded ground_truth_label=0.
-        Now receives the label from the trainer.
-        """
         from rag.rag_scorer import score_hardness as p2_score_hardness
 
         return p2_score_hardness(
@@ -98,42 +67,26 @@ class RealRAGScorer:
             t=t,
             window_errors=self.window_errors,
             vector_store=self.vector_store,
-            ground_truth_label=ground_truth_label, # PASSING THROUGH
+            ground_truth_label=ground_truth_label, 
             alphas=self.alphas,
             k_neighbors=self.k_neighbors,
             gamma=self.gamma,
         )
                            
     def get_all_scores(self, dataset_tuples) -> dict:
-        """
-        Interface B — pre-compute hardness scores for all (node_id, t) pairs.
-        Returns dict {(node_id, t): float}.
-
-        NOTE: Person 2's score_dataset() requires x_windows and graphs dicts
-        which we don't have here at pre-compute time. So we return neutral
-        scores (0.5) and let scores update dynamically during training via
-        score_hardness() calls. The curriculum will still work — it just starts
-        with uniform scores in epoch 0 and improves from epoch 1 onward.
-        """
         return {
             (node_id, t): 0.5
             for (node_id, t, _) in dataset_tuples
         }
 
     def reset(self):
-        """Call between ablation runs to clear the vector store and error history."""
         self.vector_store.reset()
         self.window_errors.clear()
 
 
 def load_rag_scorer_real(cfg):
-    """
-    Returns a RealRAGScorer wrapping Person 2's modules.
-    Falls back to MockRAGScorer if Person 2's files aren't present yet.
-    """
     try:
-        # This import will fail if rag/ folder isn't in repo yet
-        from rag.rag_scorer import score_hardness  # noqa: F401 — just testing import
+        from rag.rag_scorer import score_hardness  # noqa: F401
         print("[run_rctgad] Person 2's RAG scorer found — using RealRAGScorer")
         return RealRAGScorer(cfg)
     except ImportError:
@@ -141,12 +94,7 @@ def load_rag_scorer_real(cfg):
         return MockRAGScorer()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SINGLE SEED RUN
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_single_seed(cfg, seed, mock, results_dir):
-    """Run RC-TGAD (curriculum ON) for one seed. Returns test metrics dict."""
     import torch
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -163,7 +111,7 @@ def run_single_seed(cfg, seed, mock, results_dir):
     cfg["logging"]["run_name"]  = f"rctgad_seed{seed}"
 
     train_data, val_data, test_data = load_dataset(cfg, seed, mock)
-    backbone                        = load_backbone(cfg, mock)
+    backbone                        = load_backbone(cfg, mock=mock)
     rag_scorer = MockRAGScorer() if mock else load_rag_scorer_real(cfg)
 
     device = cfg["training"]["device"]
@@ -212,10 +160,6 @@ def run_single_seed(cfg, seed, mock, results_dir):
     return test_results, history
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COMPARISON TABLE
-# ─────────────────────────────────────────────────────────────────────────────
-
 def print_comparison(baseline_path, rctgad_results):
     if not os.path.exists(baseline_path):
         print(f"\n[Compare] Baseline file not found: {baseline_path}")
@@ -244,7 +188,7 @@ def print_comparison(baseline_path, rctgad_results):
         r_mean = rctgad_agg[metric]["mean"]
         r_std  = rctgad_agg[metric]["std"]
         delta  = r_mean - b_mean
-        arrow  = "▲" if delta > 0 else "▼"
+        arrow  = "+" if delta > 0 else "-"
         print(f"  {metric:<14} "
               f"{b_mean:.4f}±{b_std:.4f}   "
               f"{r_mean:.4f}±{r_std:.4f}   "
@@ -253,10 +197,6 @@ def print_comparison(baseline_path, rctgad_results):
     print(f"{'='*65}")
     print(f"  F1-PA and AUC-PR are the primary paper metrics.")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()

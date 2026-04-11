@@ -1,6 +1,7 @@
 import os
 import torch
 import numpy as np
+from utils.metrics import evaluate
 
 def load_dataset(cfg, seed, mock=False):
     if mock:
@@ -19,8 +20,7 @@ def load_dataset(cfg, seed, mock=False):
     else:
         raise ValueError(f"Unknown dataset {dataset_name}")
         
-    # ⚡ SQUASH THE BUG: Only return the first 3 items (train, val, test)
-    return datasets[:3]
+    return datasets[0], datasets[1], datasets[2]
 
 def load_backbone(cfg, device="cuda", mock=False):
     if mock:
@@ -40,7 +40,8 @@ def load_backbone(cfg, device="cuda", mock=False):
     return model.to(device)
 
 @torch.no_grad()
-def evaluate_on_test(model, test_ds, device="cuda", batch_size=512):
+def evaluate_on_test(model, test_ds, cfg, device="cuda"):
+    batch_size = cfg['training'].get('batch_size', 512)
     model.eval()
     all_scores, all_labels = [], []
     
@@ -58,7 +59,6 @@ def evaluate_on_test(model, test_ds, device="cuda", batch_size=512):
         y = torch.stack([d["y"] for d in batch_data])
         graph_safe = DPGraphWrapper(batch_data[0]["graph"])
         
-        # ⚡ UNPACK ALL 3 VALUES (Prevents the crash)
         _, x_hat_all, x_pred_all = model(x, graph_safe)
         
         target_recon = torch.stack([
@@ -80,4 +80,4 @@ def evaluate_on_test(model, test_ds, device="cuda", batch_size=512):
         all_scores.extend(system_scores.cpu().tolist())
         all_labels.extend(y[:, 0].tolist())
         
-    return all_scores, all_labels
+    return evaluate(all_scores, all_labels)
