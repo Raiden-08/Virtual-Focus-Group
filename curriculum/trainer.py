@@ -1,3 +1,4 @@
+
 """
 trainer.py — Unified Training Loop for RC-TGAD.
 Refactored for Unified Processing Unit [B, N, W, 1].
@@ -44,14 +45,10 @@ class MockTemporalGraphDataset(torch.utils.data.Dataset):
 # THE DATAPARALLEL SHIELD
 # ─────────────────────────────────────────────────────────────────────────────
 class DPGraphWrapper:
-    """
-    Tricks nn.DataParallel into NOT slicing the graph in half.
-    Since it's a custom object, DataParallel will pass references safely to all GPUs.
-    """
+    """Tricks nn.DataParallel into NOT slicing the graph in half."""
     def __init__(self, data):
         self.edge_index = data.edge_index
         self.edge_attr = getattr(data, 'edge_attr', None)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRAINER
@@ -65,14 +62,13 @@ class Trainer:
         config: Dict,
         use_curriculum: bool = True,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        logger=None  # 🛡️ IEEE PAPER LOGGER
+        logger=None  
     ):
         self.raw_backbone   = backbone
         self.backbone       = backbone.to(device)
         
         if device == "cuda" and torch.cuda.device_count() > 1:
             self.backbone = nn.DataParallel(self.backbone)
-            print(f"[Trainer] Using {torch.cuda.device_count()} GPUs via DataParallel")
             
         self.rag_scorer     = rag_scorer
         self.dataset        = dataset
@@ -137,7 +133,6 @@ class Trainer:
                 for n in range(N):
                     global_idx = t_base_idx * N + n
                     
-                    # RAG scorer still uses reconstruction error for curriculum pacing (stable)
                     h_val = self.rag_scorer.score_hardness(
                         z=z_all_cpu[b, n],
                         x=target_cpu[b, n],
@@ -201,13 +196,11 @@ class Trainer:
                 # ⚡ Unpack all 3
                 z_all, x_hat_all, x_pred_all = self.backbone(x, graph_safe)
                 
-                # Target for t
                 target_recon = torch.stack([
                     torch.tensor(ds.signals[d["t"]], dtype=torch.float32) 
                     for d in batch_data
                 ]).unsqueeze(-1).to(self.device)
                 
-                # Target for t+1 (Prediction)
                 target_pred = torch.stack([
                     torch.tensor(ds.signals[min(d["t"] + 1, len(ds.signals)-1)], dtype=torch.float32) 
                     for d in batch_data
@@ -289,13 +282,29 @@ class Trainer:
             all_labels.extend(system_labels.tolist())
             
         return compute_f1(all_scores, all_labels), compute_auc_pr(all_scores, all_labels)
+        
+    # ⚡ UNIVERSAL ADAPTER TRAIN METHOD
+    def train(self, *args, **kwargs) -> Dict[str, List[float]]:
+        # Universal parsing to handle both run_rctgad.py and ablations.py
+        epochs = 100
+        k_warmup = 30
+        val_dataset = None
+        save_dir = None
 
-    def train(self, epochs: int, k_warmup: int, val_dataset=None, save_dir: Optional[str] = None, **kwargs) -> Dict[str, List[float]]:
+        if len(args) > 0: epochs = args[0]
+        if len(args) > 1: k_warmup = args[1]
+        if len(args) > 2: val_dataset = args[2]
+        if len(args) > 3: save_dir = args[3]
+
+        if 'epochs' in kwargs: epochs = kwargs['epochs']
+        if 'k_warmup' in kwargs: k_warmup = kwargs['k_warmup']
+        if 'val_dataset' in kwargs: val_dataset = kwargs['val_dataset']
+        if 'save_dir' in kwargs: save_dir = kwargs['save_dir']
+
         print(f"\n[Trainer] Starting training for {epochs} epochs...")
         n_samples = len(self.dataset) * self.raw_backbone.num_nodes
         hardness_array = np.zeros(n_samples, dtype=np.float32)
 
-        # Initial Hardness Calculation for Epoch 0
         if self.use_curriculum:
             hardness_array = self._compute_hardness_from_loss()
 
@@ -305,31 +314,24 @@ class Trainer:
         for epoch in range(epochs):
             t_start = time.time()
 
-            # 1. Curriculum Data Selection
             if self.use_curriculum:
                 indices = get_batch_fast(hardness_array, epoch, k_warmup)
-                
-                # IEEE Logger: Record pacing details
                 if self.logger:
                     current_k = len(indices)
                     max_hardness = float(np.max(hardness_array[indices])) if current_k > 0 else 0.0
                     self.logger.log_curriculum_pacing(epoch, current_k, n_samples, max_hardness)
 
-                # Recompute Hardness every 10 epochs as the model gets smarter
                 if epoch > 0 and epoch % 10 == 0:
                     hardness_array = self._compute_hardness_from_loss()
             else:
                 indices = np.arange(n_samples)
 
-            # 2. Run the Dual-Loss Epoch
             train_loss = self._train_epoch(indices, batch_size)
             
-            # 3. Validation
             f1, auc_pr = 0.0, 0.0
             if val_dataset is not None and (epoch % 5 == 0 or epoch == epochs - 1):
                 f1, auc_pr = self._validate(val_dataset)
                 
-                # ⚡ BULLETPROOF SAVING LOGIC
                 if f1 > best_f1:
                     best_f1 = f1
                     out_dir = save_dir if save_dir else "checkpoints/rctgad"
@@ -338,7 +340,6 @@ class Trainer:
 
             epoch_time = time.time() - t_start
             
-            # 4. Update History
             self.history["train_loss"].append(train_loss)
             self.history["val_f1"].append(f1)
             self.history["val_auc_pr"].append(auc_pr)
@@ -350,12 +351,9 @@ class Trainer:
                 
             print(f"Epoch {epoch:03d} | Loss: {train_loss:.4f} | F1: {f1:.4f} | Time: {epoch_time:.1f}s")
 
-            # IEEE Logger
             if self.logger:
                 self.logger.log_epoch(epoch, train_loss, f1, epoch_time)
 
-            # 5. Garbage Collection
-            import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
