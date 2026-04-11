@@ -289,8 +289,8 @@ class Trainer:
             all_labels.extend(system_labels.tolist())
             
         return compute_f1(all_scores, all_labels), compute_auc_pr(all_scores, all_labels)
-        
-    def train(self, epochs: int, k_warmup: int, val_dataset=None) -> Dict[str, List[float]]:
+
+    def train(self, epochs: int, k_warmup: int, val_dataset=None, save_dir: Optional[str] = None, **kwargs) -> Dict[str, List[float]]:
         print(f"\n[Trainer] Starting training for {epochs} epochs...")
         n_samples = len(self.dataset) * self.raw_backbone.num_nodes
         hardness_array = np.zeros(n_samples, dtype=np.float32)
@@ -329,11 +329,12 @@ class Trainer:
             if val_dataset is not None and (epoch % 5 == 0 or epoch == epochs - 1):
                 f1, auc_pr = self._validate(val_dataset)
                 
-                # Save the best weights
+                # ⚡ BULLETPROOF SAVING LOGIC
                 if f1 > best_f1:
                     best_f1 = f1
-                    os.makedirs("checkpoints/rctgad", exist_ok=True)
-                    torch.save(self.raw_backbone.state_dict(), "checkpoints/rctgad/best_model.pt")
+                    out_dir = save_dir if save_dir else "checkpoints/rctgad"
+                    os.makedirs(out_dir, exist_ok=True)
+                    torch.save(self.raw_backbone.state_dict(), os.path.join(out_dir, "best_model.pt"))
 
             epoch_time = time.time() - t_start
             
@@ -353,7 +354,8 @@ class Trainer:
             if self.logger:
                 self.logger.log_epoch(epoch, train_loss, f1, epoch_time)
 
-            # 5. Garbage Collection (Prevents Kaggle RAM crashes)
+            # 5. Garbage Collection
+            import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
