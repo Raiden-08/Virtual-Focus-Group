@@ -289,3 +289,73 @@ class Trainer:
             all_labels.extend(system_labels.tolist())
             
         return compute_f1(all_scores, all_labels), compute_auc_pr(all_scores, all_labels)
+        
+    def train(self, epochs: int, k_warmup: int, val_dataset=None) -> Dict[str, List[float]]:
+        print(f"\n[Trainer] Starting training for {epochs} epochs...")
+        n_samples = len(self.dataset) * self.raw_backbone.num_nodes
+        hardness_array = np.zeros(n_samples, dtype=np.float32)
+
+        # Initial Hardness Calculation for Epoch 0
+        if self.use_curriculum:
+            hardness_array = self._compute_hardness_from_loss()
+
+        best_f1 = -1.0
+        batch_size = self.config.get("batch_size", 512)
+
+        for epoch in range(epochs):
+            t_start = time.time()
+
+            # 1. Curriculum Data Selection
+            if self.use_curriculum:
+                indices = get_batch_fast(hardness_array, epoch, k_warmup)
+                
+                # IEEE Logger: Record pacing details
+                if self.logger:
+                    current_k = len(indices)
+                    max_hardness = float(np.max(hardness_array[indices])) if current_k > 0 else 0.0
+                    self.logger.log_curriculum_pacing(epoch, current_k, n_samples, max_hardness)
+
+                # Recompute Hardness every 10 epochs as the model gets smarter
+                if epoch > 0 and epoch % 10 == 0:
+                    hardness_array = self._compute_hardness_from_loss()
+            else:
+                indices = np.arange(n_samples)
+
+            # 2. Run the Dual-Loss Epoch
+            train_loss = self._train_epoch(indices, batch_size)
+            
+            # 3. Validation
+            f1, auc_pr = 0.0, 0.0
+            if val_dataset is not None and (epoch % 5 == 0 or epoch == epochs - 1):
+                f1, auc_pr = self._validate(val_dataset)
+                
+                # Save the best weights
+                if f1 > best_f1:
+                    best_f1 = f1
+                    os.makedirs("checkpoints/rctgad", exist_ok=True)
+                    torch.save(self.raw_backbone.state_dict(), "checkpoints/rctgad/best_model.pt")
+
+            epoch_time = time.time() - t_start
+            
+            # 4. Update History
+            self.history["train_loss"].append(train_loss)
+            self.history["val_f1"].append(f1)
+            self.history["val_auc_pr"].append(auc_pr)
+            
+            if self.use_curriculum:
+                self.history["pct_data"].append(len(indices) / n_samples)
+            else:
+                self.history["pct_data"].append(1.0)
+                
+            print(f"Epoch {epoch:03d} | Loss: {train_loss:.4f} | F1: {f1:.4f} | Time: {epoch_time:.1f}s")
+
+            # IEEE Logger
+            if self.logger:
+                self.logger.log_epoch(epoch, train_loss, f1, epoch_time)
+
+            # 5. Garbage Collection (Prevents Kaggle RAM crashes)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return self.history

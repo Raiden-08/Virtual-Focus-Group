@@ -3,7 +3,7 @@ rag/analysis/
 __pycache__/
 *.py[cod]
 *$py.class
-data/
+data/raw/
 *.npy
 *.csv
 *.zip
