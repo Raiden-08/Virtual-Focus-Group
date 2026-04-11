@@ -1,0 +1,72 @@
+﻿python : C:\Users\Atlas\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-pac
+kages\torch\nn\modules\loss.py:634: UserWarning: Using a target size 
+(torch.Size([160, 8])) that is different to the input size 
+(torch.Size([160, 16])). This will likely lead to incorrect results 
+due to broadcasting. Please ensure they have the same size.
+At line:1 char:22
++ ... v:PYTHONPATH='.'; python curriculum/trainer.py > smoke_error.txt 
+2>&1
++                       
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\Atlas\... the sa 
+   me size.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  return F.mse_loss(input, target, reduction=self.reduction)
+============================================================
+TRAINER SMOKE TEST
+============================================================
+
+--- Baseline (no curriculum) ---
+[Trainer] Device    : cpu
+[Trainer] Curriculum: OFF (baseline mode)
+[Trainer] Dataset   : 500 samples
+
+[Trainer] Starting training for 20 epochs...
+------------------------------------------------------------
+Traceback (most recent call last):
+  File "E:\sem6\Gen 
+AI\project\Virtual-Focus-Group\curriculum\trainer.py", line 591, in 
+<module>
+    h1 = t1.train(val_dataset=val_ds, save_dir="checkpoints/baseline")
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\sem6\Gen 
+AI\project\Virtual-Focus-Group\curriculum\trainer.py", line 491, in 
+train
+    train_loss = self._train_epoch(indices, batch_size)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\sem6\Gen 
+AI\project\Virtual-Focus-Group\curriculum\trainer.py", line 383, in 
+_train_epoch
+    loss = self.recon_loss_fn(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Atlas\AppData\Local\Packages\PythonSoftwareFoundation.
+Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-pack
+ages\torch\nn\modules\module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Atlas\AppData\Local\Packages\PythonSoftwareFoundation.
+Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-pack
+ages\torch\nn\modules\module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Atlas\AppData\Local\Packages\PythonSoftwareFoundation.
+Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-pack
+ages\torch\nn\modules\loss.py", line 634, in forward
+    return F.mse_loss(input, target, reduction=self.reduction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Atlas\AppData\Local\Packages\PythonSoftwareFoundation.
+Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-pack
+ages\torch\nn\functional.py", line 3864, in mse_loss
+    expanded_input, expanded_target = torch.broadcast_tensors(input, 
+target)
+                                      
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Atlas\AppData\Local\Packages\PythonSoftwareFoundation.
+Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\site-pack
+ages\torch\functional.py", line 77, in broadcast_tensors
+    return _VF.broadcast_tensors(tensors)  # type: ignore[attr-defined]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (16) must match the size of tensor 
+b (8) at non-singleton dimension 1
