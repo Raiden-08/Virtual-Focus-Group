@@ -16,8 +16,10 @@ _scorer_lock = threading.Lock()
 
 def score_hardness(
     z: torch.Tensor,
-    x: torch.Tensor,
-    x_hat: torch.Tensor,
+    x_recon_target: torch.Tensor,
+    x_recon: torch.Tensor,
+    x_pred_target: torch.Tensor,
+    x_pred: torch.Tensor,
     node_id: int,
     graph,
     t: int,
@@ -33,11 +35,13 @@ def score_hardness(
 ) -> Union[float, Tuple[float, float, float, float]]:
     alpha_1, alpha_2, alpha_3 = alphas
 
-    # 1. Compute H_temp using CURRENT history
-    h_temp = compute_h_temp(x, x_hat, window_errors)
+    # 1. Compute H_temp using CURRENT history (Dual Loss summation)
+    h_temp = compute_h_temp(x_recon_target, x_recon, x_pred_target, x_pred, window_errors)
     
-    # 2. Calculate error magnitude
-    e = torch.norm(x - x_hat, p=2).item()
+    # 2. Calculate error magnitude (Dual Loss)
+    recon_e = torch.norm(x_recon_target - x_recon, p=2).item()
+    pred_e = torch.norm(x_pred_target - x_pred, p=2).item()
+    e = recon_e + pred_e
     
     # 3. H_struct
     h_struct = compute_h_struct(node_id, graph, anomaly_source_id, gamma)
